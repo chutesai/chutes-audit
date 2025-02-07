@@ -6,7 +6,10 @@ import yaml
 import orjson as json
 import asyncio
 import tempfile
+import numpy as np
 import pybase64 as base64
+import sounddevice as sd
+from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
 from typing import AsyncGenerator
@@ -104,6 +107,7 @@ class Synthetic(Base):
 class Target(BaseModel):
     instance_id: str
     invocation_id: str
+    child_id: str
     uid: str
     hotkey: str
     error: str = None
@@ -185,7 +189,7 @@ class Auditor:
             "messages": messages,
             "temperature": random.random() + 0.1,
             "seed": random.randint(0, 1000000000),
-            "max_tokens": random.randint(5, 100),
+            "max_tokens": random.randint(10, 200),
             "stream": True,
             "logprobs": True,
         }
@@ -241,6 +245,59 @@ class Auditor:
             return None
         return random.choice(diffusion_chutes)
 
+    def _get_tts_chute(self):
+        """
+        Randomly select a hot TTS chute.
+        """
+        tts_chutes = [
+            chute
+            for chute in self.chutes.values()
+            if any([cord.path == "/speak" and not cord.stream for cord in chute.cords])
+            and chute.user.username == "chutes"
+        ]
+        if not tts_chutes:
+            logger.warning("No TTS chutes hot.")
+            return None
+        return random.choice(tts_chutes)
+
+    def _render(self, chute, data):
+        if chute.standard_template == "diffusion" and self.config.synthetics.image.render:
+            try:
+                if (
+                    chute.standard_template == "diffusion"
+                    and isinstance(data["result"], dict)
+                    and data["result"].get("bytes")
+                ):
+                    with tempfile.NamedTemporaryFile(mode="wb") as outfile:
+                        outfile.write(base64.b64decode(data["result"]["bytes"].encode()))
+                        outfile.flush()
+                        image = image_from_file(outfile.name)
+                        image.draw()
+            except Exception as exc:
+                logger.warning(f"Could not render image: {exc}")
+        elif chute.standard_template == "vllm" and self.config.synthetics.text.render:
+            try:
+                chunk_data = json.loads(data["result"][6:])
+                if chunk_data["choices"][0].get("delta"):
+                    print(chunk_data["choices"][0]["delta"]["content"], end="", flush=True)
+                else:
+                    print(chunk_data["choices"][0]["text"], end="", flush=True)
+            except Exception:
+                ...
+        elif chute.standard_template == "tts" and self.config.synthetics.tts.render:
+            try:
+                if (
+                    chute.standard_template == "tts"
+                    and isinstance(data["result"], dict)
+                    and data["result"].get("bytes")
+                ):
+                    chunk_data = base64.b64decode(data["result"]["bytes"].encode())
+                    audio_chunk = np.frombuffer(chunk_data, np.float32)
+                    sd.play(audio_chunk, 24000)
+                    sd.wait()
+            except Exception as exc:
+                print(f"ERROR PLAYING AUDIO: {exc}")
+
     async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
         """
         Perform invocation request.
@@ -291,25 +348,7 @@ class Auditor:
                         elif data.get("error"):
                             logger.error(data["error"])
                         elif data.get("result"):
-                            logger.debug(f"Received {len(chunk_bytes)} result bytes...")
-
-                            # Display images.
-                            if self.config.synthetics.image.render:
-                                try:
-                                    if (
-                                        chute.standard_template == "diffusion"
-                                        and isinstance(data["result"], dict)
-                                        and data["result"].get("bytes")
-                                    ):
-                                        with tempfile.NamedTemporaryFile(mode="wb") as outfile:
-                                            outfile.write(
-                                                base64.b64decode(data["result"]["bytes"].encode())
-                                            )
-                                            outfile.flush()
-                                            image = image_from_file(outfile.name)
-                                            image.draw()
-                                except Exception as exc:
-                                    logger.warning(f"Could not render image: {exc}")
+                            self._render(chute, data)
             return synthetics
         except Exception as exc:
             logger.warning(f"Error performing synthetic request: {exc}")
@@ -348,6 +387,7 @@ class Auditor:
         if re_match:
             return Target(
                 invocation_id=chunk["trace"].get("invocation_id"),
+                child_id=chunk["trace"].get("child_id"),
                 instance_id=re_match.group(1),
                 uid=re_match.group(2),
                 hotkey=re_match.group(3),
@@ -369,6 +409,7 @@ class Auditor:
         if re_match:
             return Target(
                 invocation_id=chunk["trace"].get("invocation_id"),
+                child_id=chunk["trace"].get("child_id"),
                 instance_id=re_match.group(1),
                 uid=re_match.group(2),
                 hotkey=re_match.group(3),
@@ -385,6 +426,7 @@ class Auditor:
         synthetics = await self._perform_request(
             chute, payload, "https://llm.chutes.ai/v1/chat/completions"
         )
+        print("", flush=True)
         logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
         return synthetics
 
@@ -393,11 +435,12 @@ class Auditor:
         Perform a single LLM completion request, with trace SSEs to see raw events.
         """
         if (chute := self._get_vllm_chute()) is None:
-            return None
+            return []
         payload = self.get_random_text_payload(model=chute.name, endpoint="completion")
         synthetics = await self._perform_request(
             chute, payload, "https://llm.chutes.ai/v1/completions"
         )
+        print("", flush=True)
         logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
         return synthetics
 
@@ -406,12 +449,49 @@ class Auditor:
         Perform a single image generation request.
         """
         if (chute := self._get_diffusion_chute()) is None:
-            return None
+            return []
         payload = self.get_random_image_payload(model=chute.name)
         synthetics = await self._perform_request(
             chute, payload, f"https://{chute.slug}.chutes.ai/generate"
         )
         logger.info(f"Image generation request generated {len(synthetics)} invocation objects.")
+        return synthetics
+
+    async def _perform_tts(self) -> list[Synthetic]:
+        """
+        Perform a single text-to-speech request.
+        """
+        if (chute := self._get_tts_chute()) is None:
+            return []
+        while text := self.get_random_image_payload(model=chute.name)["prompt"][:1000]:
+            try:
+                language = detect_language(text)
+                if language == "en":
+                    break
+            except Exception:
+                ...
+        payload = {"text": text}
+        if chute.name == "Kokoro-82M":
+            payload["voice"] = random.choice(
+                [
+                    "af",
+                    "af_bella",
+                    "af_sarah",
+                    "am_adam",
+                    "am_michael",
+                    "bf_emma",
+                    "bf_isabella",
+                    "bm_george",
+                    "bm_lewis",
+                    "af_nicole",
+                    "af_sky",
+                ]
+            )
+
+        synthetics = await self._perform_request(
+            chute, payload, f"https://{chute.slug}.chutes.ai/speak"
+        )
+        logger.info(f"TTS generation request generated {len(synthetics)} invocation objects.")
         return synthetics
 
     async def perform_synthetic(self):
@@ -425,8 +505,8 @@ class Auditor:
             [
                 # "chat",
                 # "completion",
-                "image",
-                # "tts",
+                # "image",
+                "tts",
                 # "embedding",
                 # "moderation",
             ]
@@ -468,8 +548,12 @@ class Auditor:
         """
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        await self.perform_synthetic()
-        return
+        try:
+            await self.perform_synthetic()
+            return
+        finally:
+            if self._asession:
+                await self._asession.close()
 
         tasks = []
         try:
@@ -480,9 +564,6 @@ class Auditor:
         except KeyboardInterrupt:
             self._running = False
             await asyncio.gather(*tasks)
-        finally:
-            if self._asession:
-                await self._asession.close()
 
 
 async def main():
