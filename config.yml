@@ -1,0 +1,30 @@
+# Synthetics config, which currently only supports the chutes validator but can be extended to support any.
+synthetics:
+  enabled: true
+
+  # Use LLMs synthetically?
+  text:
+    enabled: true
+    dataset:
+      name: allenai/WildChat-1M
+      options:
+        split: train
+      field_name: conversation
+
+  # Generate images synthetically?
+  image:
+    enabled: true
+    dataset:
+      name: Falah/image_generation_prompts_SDXL
+      options:
+        split: train
+      field_name: prompts
+
+  # API key to use for synthetics - need to register new user(s) first, then generate API key(s)
+  api_key: cpk_53a08efc396d4e31990420b1c6b153f5.dff3e6bb3a6b5a2b9c48da3abcd5ca5f.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# Which validators to audit.
+validators:
+- name: Chutes
+  hotkey: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
+  url: https://api.chutes.ai

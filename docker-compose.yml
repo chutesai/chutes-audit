@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: chutes_audit
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  auditor:
+    build:
+      context: .
+    volumes:
+      - ./:/audit
+      - hfcache:/root/.cache
+      - ./reports:/reports
+    environment:
+      - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes
+    restart: always
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  hfcache:

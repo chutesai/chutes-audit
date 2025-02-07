@@ -1,0 +1,27 @@
+[project]
+name = "chutes-audit"
+version = "0.0.1"
+description = "chutes.ai/subnet 64 auditing system"
+authors = [
+    {name = "Jon Durbin",email = "jon@chutes.ai"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10,<4"
+dependencies = [
+    "aiohttp (>=3.11.11,<4.0.0)",
+    "asyncpg (>=0.30.0,<0.31.0)",
+    "sqlalchemy (>=2.0.37,<3.0.0)",
+    "loguru (>=0.7.3,<0.8.0)",
+    "datasets (>=3.2.0,<4.0.0)",
+    "munch (>=4.0.0,<5.0.0)",
+    "ruff (>=0.9.4,<0.10.0)",
+    "pydantic (>=2.10.6,<3.0.0)",
+    "orjson (>=3.10.15,<4.0.0)",
+    "pybase64 (>=1.4.0,<2.0.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
