@@ -4,11 +4,10 @@ import random
 import aiohttp
 import yaml
 import orjson as json
-import gzip
 import asyncio
-import pickle
+import tempfile
 import pybase64 as base64
-import pandas as pd
+from term_image.image import from_file as image_from_file
 from loguru import logger
 from typing import AsyncGenerator
 from pydantic import BaseModel
@@ -116,9 +115,7 @@ class Auditor:
         Load config.
         """
         if not config_path:
-            config_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "config.yml"
-            )
+            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
         logger.debug(f"Loading {config_path=}")
         with open(config_path, "r") as infile:
             self.config = munchify(yaml.safe_load(infile))
@@ -149,19 +146,25 @@ class Auditor:
             if self._asession is None or self._asession.closed:
                 self._asession = aiohttp.ClientSession(
                     connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=120, force_close=False),
+                    read_bufsize=64 * 1024 * 1024,
                     raise_for_status=False,
                     trust_env=True,
                 )
             yield self._asession
 
-    def get_random_image_prompt(self):
+    def get_random_image_payload(self, model: str):
         """
-        Get a random prompt for diffusion chutes.
+        Get a random request payload for diffusion chutes.
         """
         prompt = self.image_prompts[random.randint(0, len(self.image_prompts))][
             self.config.synthetics.image.dataset.field_name
         ]
-        return prompt.lstrip('"').rstrip('"').replace('\\"', '"')
+        prompt = prompt.lstrip('"').rstrip('"').replace('\\"', '"')
+        return {
+            "prompt": prompt,
+            "seed": random.randint(0, 1000000000),
+            "num_inference_steps": random.randint(5, 30),
+        }
 
     def get_random_text_payload(self, model: str, endpoint: str = "chat"):
         """
@@ -182,7 +185,7 @@ class Auditor:
             "messages": messages,
             "temperature": random.random() + 0.1,
             "seed": random.randint(0, 1000000000),
-            "max_tokens": random.randint(5, 20),
+            "max_tokens": random.randint(5, 100),
             "stream": True,
             "logprobs": True,
         }
@@ -196,7 +199,9 @@ class Auditor:
         """
         logger.debug("Loading chutes from API...")
         async with self.aiosession() as session:
-            async with session.get("https://api.chutes.ai/chutes/?include_public=true&limit=1000") as resp:
+            async with session.get(
+                "https://api.chutes.ai/chutes/?include_public=true&limit=1000"
+            ) as resp:
                 data = await resp.json()
                 chutes = {}
                 for item in data["items"]:
@@ -213,12 +218,28 @@ class Auditor:
             for chute in self.chutes.values()
             if chute.standard_template == "vllm"
             and any([instance.active and instance.verified for instance in chute.instances])
-            and chute.name == "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
         ]
         if not vllm_chutes:
             logger.warning("No vllm chutes hot - this is very bad and should not really happen...")
             return None
         return random.choice(vllm_chutes)
+
+    def _get_diffusion_chute(self):
+        """
+        Randomly select a hot diffusion chute.
+        """
+        diffusion_chutes = [
+            chute
+            for chute in self.chutes.values()
+            if chute.standard_template == "diffusion"
+            and any([instance.active and instance.verified for instance in chute.instances])
+        ]
+        if not diffusion_chutes:
+            logger.warning(
+                "No diffusion chutes hot - this is very bad and should not really happen..."
+            )
+            return None
+        return random.choice(diffusion_chutes)
 
     async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
         """
@@ -228,9 +249,18 @@ class Auditor:
             synthetics = []
             async with self.aiosession() as session:
                 logger.info(f"Invoking {chute.name=} at {url}")
-                async with session.post(url, headers={"Authorization": f"Bearer {self.config.synthetics.api_key}", "X-Chutes-Trace": "true"}, json=payload) as resp:
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self.config.synthetics.api_key}",
+                        "X-Chutes-Trace": "true",
+                    },
+                    json=payload,
+                ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Error sending synthetic to {chute.chute_id} [{chute.name}]: {resp.status=} {await resp.text()}")
+                        logger.warning(
+                            f"Error sending synthetic to {chute.chute_id} [{chute.name}]: {resp.status=} {await resp.text()}"
+                        )
                         return
                     parent_id = resp.headers["X-Chutes-InvocationID"]
                     async for chunk_bytes in resp.content:
@@ -240,16 +270,18 @@ class Auditor:
                         target = self._extract_target(data)
                         if (target := self._extract_target(data)) is not None:
                             self._debug_target(data)
-                            synthetics.append(Synthetic(
-                                instance_id=target.instance_id,
-                                parent_invocation_id=parent_id,
-                                invocation_id=target.invocation_id,
-                                chute_id=chute.chute_id,
-                                miner_uid=target.uid,
-                                miner_hotkey=target.hotkey,
-                                created_at=func.now(),
-                                has_error=False
-                            ))
+                            synthetics.append(
+                                Synthetic(
+                                    instance_id=target.instance_id,
+                                    parent_invocation_id=parent_id,
+                                    invocation_id=target.invocation_id,
+                                    chute_id=chute.chute_id,
+                                    miner_uid=target.uid,
+                                    miner_hotkey=target.hotkey,
+                                    created_at=func.now(),
+                                    has_error=False,
+                                )
+                            )
                         elif (target := self._extract_target_error(data)) is not None:
                             logger.warning(target.error)
                             # Can't really not be the case that we're not talking about the existing attempt.
@@ -258,8 +290,26 @@ class Auditor:
                             synthetics[-1].has_error = True
                         elif data.get("error"):
                             logger.error(data["error"])
-                        elif data.get("result") and data["result"].strip():
+                        elif data.get("result"):
                             logger.debug(f"Received {len(chunk_bytes)} result bytes...")
+
+                            # Display images.
+                            if self.config.synthetics.image.render:
+                                try:
+                                    if (
+                                        chute.standard_template == "diffusion"
+                                        and isinstance(data["result"], dict)
+                                        and data["result"].get("bytes")
+                                    ):
+                                        with tempfile.NamedTemporaryFile(mode="wb") as outfile:
+                                            outfile.write(
+                                                base64.b64decode(data["result"]["bytes"].encode())
+                                            )
+                                            outfile.flush()
+                                            image = image_from_file(outfile.name)
+                                            image.draw()
+                                except Exception as exc:
+                                    logger.warning(f"Could not render image: {exc}")
             return synthetics
         except Exception as exc:
             logger.warning(f"Error performing synthetic request: {exc}")
@@ -300,10 +350,10 @@ class Auditor:
                 invocation_id=chunk["trace"].get("invocation_id"),
                 instance_id=re_match.group(1),
                 uid=re_match.group(2),
-                hotkey=re_match.group(3)
+                hotkey=re_match.group(3),
             )
         return None
-    
+
     @staticmethod
     def _extract_target_error(chunk) -> Target:
         """
@@ -312,14 +362,17 @@ class Auditor:
         if not chunk.get("trace"):
             return None
         message = chunk["trace"].get("message")
-        re_match = re.search(r"error encountered while querying target=([^ ]+) uid=([0-9]+) hotkey=([^ ]+) coldkey=[^ ]+: (.*)", message)
+        re_match = re.search(
+            r"error encountered while querying target=([^ ]+) uid=([0-9]+) hotkey=([^ ]+) coldkey=[^ ]+: (.*)",
+            message,
+        )
         if re_match:
             return Target(
                 invocation_id=chunk["trace"].get("invocation_id"),
                 instance_id=re_match.group(1),
                 uid=re_match.group(2),
                 hotkey=re_match.group(3),
-                error=re_match.group(4)
+                error=re_match.group(4),
             )
 
     async def _perform_chat(self) -> list[Synthetic]:
@@ -329,8 +382,36 @@ class Auditor:
         if (chute := self._get_vllm_chute()) is None:
             return None
         payload = self.get_random_text_payload(model=chute.name, endpoint="chat")
-        synthetics = await self._perform_request(chute, payload, "https://llm.chutes.ai/v1/chat/completions")
-        logger.info(f"Chat invocation generated {len(synthetics)} synthetic requests.")
+        synthetics = await self._perform_request(
+            chute, payload, "https://llm.chutes.ai/v1/chat/completions"
+        )
+        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
+        return synthetics
+
+    async def _perform_completion(self) -> list[Synthetic]:
+        """
+        Perform a single LLM completion request, with trace SSEs to see raw events.
+        """
+        if (chute := self._get_vllm_chute()) is None:
+            return None
+        payload = self.get_random_text_payload(model=chute.name, endpoint="completion")
+        synthetics = await self._perform_request(
+            chute, payload, "https://llm.chutes.ai/v1/completions"
+        )
+        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
+        return synthetics
+
+    async def _perform_image(self) -> list[Synthetic]:
+        """
+        Perform a single image generation request.
+        """
+        if (chute := self._get_diffusion_chute()) is None:
+            return None
+        payload = self.get_random_image_payload(model=chute.name)
+        synthetics = await self._perform_request(
+            chute, payload, f"https://{chute.slug}.chutes.ai/generate"
+        )
+        logger.info(f"Image generation request generated {len(synthetics)} invocation objects.")
         return synthetics
 
     async def perform_synthetic(self):
@@ -340,14 +421,16 @@ class Auditor:
         await self.load_chutes()
 
         # Randomly select a task to perform.
-        task_type = random.choice([
-            "chat",
-            #"prompt",
-            #"image",
-            #"tts",
-            #"embedding",
-            #"moderation",
-        ])
+        task_type = random.choice(
+            [
+                # "chat",
+                # "completion",
+                "image",
+                # "tts",
+                # "embedding",
+                # "moderation",
+            ]
+        )
         logger.info(f"Attempting to perform synthetic task: {task_type=}")
         synthetics = await getattr(self, f"_perform_{task_type}")()
         if not synthetics:
@@ -364,7 +447,8 @@ class Auditor:
         """
         async with self.aiosession() as session:
             async with session.get("https://api.chutes.ai/audit/") as resp:
-                audit_data = await resp.json()
+                data = await resp.json()
+                chutes = {}
                 for item in data["items"]:
                     item["cords"] = data.get("cord_refs", {}).get(item["cord_ref_id"], [])
                     chutes[item["chute_id"]] = munchify(item)
@@ -389,8 +473,8 @@ class Auditor:
 
         tasks = []
         try:
-            #tasks.append(asyncio.create_task(self.perform_synthetics()))
-            #tasks.append(asyncio.create_task(self.check_integrity()))
+            # tasks.append(asyncio.create_task(self.perform_synthetics()))
+            # tasks.append(asyncio.create_task(self.check_integrity()))
             while True:
                 await asyncio.sleep(60)
         except KeyboardInterrupt:
