@@ -7,10 +7,12 @@ import yaml
 import orjson as json
 import asyncio
 import tempfile
+from pathlib import Path
 import numpy as np
 import pybase64 as base64
 import sounddevice as sd
 import soundfile as sf
+from datetime import datetime
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
@@ -18,7 +20,7 @@ from typing import AsyncGenerator
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, String, DateTime, Double, Integer, Boolean, BigInteger, func
+from sqlalchemy import Column, String, DateTime, Double, Integer, Boolean, BigInteger, func, select
 from munch import munchify
 from datasets import load_dataset
 from contextlib import asynccontextmanager
@@ -262,6 +264,22 @@ class Auditor:
             return None
         return random.choice(tts_chutes)
 
+    def _get_tei_chute(self, endpoint: str = "/embed"):
+        """
+        Get text-embeding-inference chutes.
+        """
+        tei_chutes = [
+            chute
+            for chute in self.chutes.values()
+            if chute.standard_template == "tei"
+            and any([cord.path == endpoint for cord in chute.cords])
+            and chute.user.username == "chutes"
+        ]
+        if not tei_chutes:
+            logger.warning("No TEI chutes hot.")
+            return None
+        return random.choice(tei_chutes)
+
     def _render(self, chute, data):
         if chute.standard_template == "diffusion" and self.config.synthetics.image.render:
             try:
@@ -288,22 +306,26 @@ class Auditor:
                 ...
         elif chute.standard_template == "tts" and self.config.synthetics.tts.render:
             try:
-                if (
-                    chute.standard_template == "tts"
-                    and isinstance(data["result"], dict)
-                    and data["result"].get("bytes")
-                ):
+                if isinstance(data["result"], dict) and data["result"].get("bytes"):
                     chunk_data = base64.b64decode(data["result"]["bytes"].encode())
                     audio_io = io.BytesIO(chunk_data)
                     audio_chunk, sr = sf.read(audio_io)
                     if len(audio_chunk.shape) > 1:
                         audio_chunk = np.mean(audio_chunk, axis=1)
                     audio_chunk = audio_chunk.astype(np.float32)
-                    logger.info(f"Playing audio, turn up your volume...")
+                    logger.info("Playing audio, turn up your volume...")
                     sd.play(audio_chunk, 24000)
                     sd.wait()
             except Exception as exc:
                 logger.warning(f"Error playing audio: {exc}")
+        elif chute.standard_template == "tei" and self.config.synthetics.embed.render:
+            try:
+                if data["result"].get("json"):
+                    logger.info(
+                        f"Generated a matrix with shape: {np.array(data['result']['json']).shape}"
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to render embeddings: {exc}")
 
     async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
         """
@@ -502,6 +524,20 @@ class Auditor:
         logger.info(f"TTS generation request generated {len(synthetics)} invocation objects.")
         return synthetics
 
+    async def _perform_embedding(self) -> list[Synthetic]:
+        """
+        Perform a single text embedding request.
+        """
+        if (chute := self._get_tei_chute("/embed")) is None:
+            return []
+        text = self.get_random_image_payload(model=chute.name)["prompt"][:500]
+        payload = {"inputs": [text]}
+        synthetics = await self._perform_request(
+            chute, payload, f"https://{chute.slug}.chutes.ai/embed"
+        )
+        logger.info(f"Text embedding request generated {len(synthetics)} invocation objects.")
+        return synthetics
+
     async def perform_synthetic(self):
         """
         Send a single, random synthetic request.
@@ -511,12 +547,11 @@ class Auditor:
         # Randomly select a task to perform.
         task_type = random.choice(
             [
-                # "chat",
-                # "completion",
-                # "image",
+                "chat",
+                "completion",
+                "image",
                 "tts",
-                # "embedding",
-                # "moderation",
+                "embedding",
             ]
         )
         logger.info(f"Attempting to perform synthetic task: {task_type=}")
@@ -529,18 +564,50 @@ class Auditor:
             await session.commit()
         logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
 
-    async def fetch_audit_reports(self):
+    async def check_audit_reports(self):
         """
-        Pull all audit reports.
+        Fetch and verify all audit reports.
         """
         async with self.aiosession() as session:
             async with session.get("https://api.chutes.ai/audit/") as resp:
-                data = await resp.json()
-                chutes = {}
-                for item in data["items"]:
-                    item["cords"] = data.get("cord_refs", {}).get(item["cord_ref_id"], [])
-                    chutes[item["chute_id"]] = munchify(item)
-                self.chutes = chutes
+                audit_records = await resp.json()
+                by_id = {record["entry_id"]: record for record in audit_records}
+        async with get_session() as session:
+            existing_ids = (
+                (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
+            )
+        new_records = []
+        for _id, record in by_id.items():
+            if _id in existing_ids:
+                continue
+            record = AuditEntry(
+                entry_id=record["entry_id"],
+                hotkey=record["hotkey"],
+                block=record["block"],
+                path=record["path"],
+                created_at=datetime.fromisoformat(record["created_at"].rstrip("Z")),
+                start_time=datetime.fromisoformat(record["start_time"].rstrip("Z")),
+                end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")),
+            )
+            new_records.append(record)
+            logger.info(
+                f"Need to verify new audit entry: {record.entry_id} "
+                f"for data between {record.start_time} and {record.end_time}"
+            )
+            path = Path(os.path.join("reports", record.path)).resolve()
+            try:
+                path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+            except ValueError:
+                raise ValueError(f"Path {record.path} attempts to escape base directory!")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            async with self.aiosession() as session:
+                async with session.get(
+                    "https://api.chutes.ai/audit/download", params={"path": record.path}
+                ) as resp:
+                    with open(path, "wb") as outfile:
+                        outfile.write(await resp.read())
+            logger.success(f"Successfully download {record.path} committed in block {record.block}")
+            break
 
     async def perform_synthetics(self):
         """
@@ -556,12 +623,16 @@ class Auditor:
         """
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        try:
-            await self.perform_synthetic()
-            return
-        finally:
-            if self._asession:
-                await self._asession.close()
+
+        await self.check_audit_reports()
+        return
+
+        # try:
+        #    await self.perform_synthetic()
+        #    return
+        # finally:
+        #    if self._asession:
+        #        await self._asession.close()
 
         tasks = []
         try:
