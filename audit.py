@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import random
@@ -9,6 +10,7 @@ import tempfile
 import numpy as np
 import pybase64 as base64
 import sounddevice as sd
+import soundfile as sf
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
@@ -292,11 +294,16 @@ class Auditor:
                     and data["result"].get("bytes")
                 ):
                     chunk_data = base64.b64decode(data["result"]["bytes"].encode())
-                    audio_chunk = np.frombuffer(chunk_data, np.float32)
+                    audio_io = io.BytesIO(chunk_data)
+                    audio_chunk, sr = sf.read(audio_io)
+                    if len(audio_chunk.shape) > 1:
+                        audio_chunk = np.mean(audio_chunk, axis=1)
+                    audio_chunk = audio_chunk.astype(np.float32)
+                    logger.info(f"Playing audio, turn up your volume...")
                     sd.play(audio_chunk, 24000)
                     sd.wait()
             except Exception as exc:
-                print(f"ERROR PLAYING AUDIO: {exc}")
+                logger.warning(f"Error playing audio: {exc}")
 
     async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
         """
@@ -470,6 +477,7 @@ class Auditor:
                     break
             except Exception:
                 ...
+        chute.standard_template = "tts"
         payload = {"text": text}
         if chute.name == "Kokoro-82M":
             payload["voice"] = random.choice(

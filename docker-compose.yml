@@ -19,7 +19,7 @@ services:
       - hfcache:/root/.cache
       - ./reports:/reports
     environment:
-      - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes
+      - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes_audit
     restart: always
     depends_on:
       - postgres
