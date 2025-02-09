@@ -7,6 +7,7 @@ import shutil
 import random
 import aiohttp
 import yaml
+import tqdm
 import orjson as json
 import asyncio
 import tempfile
@@ -798,7 +799,18 @@ class Auditor:
         total = 0
         for item in audit_data.get(key, []):
             try:
-                item["audit_id"] = str(uuid.uuid5(uuid.NAMESPACE_OID, json.dumps(item).decode()))
+                item["audit_id"] = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_OID,
+                        ":".join(
+                            [
+                                json.dumps(item).decode(),
+                                record.entry_id,
+                                record.hotkey,
+                            ]
+                        ),
+                    )
+                )
                 item["entry_id"] = record.entry_id
                 audit = InstanceAudit(**item)
                 audit.source = "validator" if record.hotkey in self.validators else "miner"
@@ -883,9 +895,8 @@ class Auditor:
 
         # Now load all new audit records.
         total = 0
-        for _id, record in by_id.items():
-            if _id in existing_ids:
-                continue
+        by_id = {k: v for k, v in by_id.items() if k not in existing_ids}
+        for _id, record in tqdm.tqdm(by_id.items()):
             total += 1
             db_record = AuditEntry(
                 entry_id=record["entry_id"],
@@ -948,9 +959,6 @@ class Auditor:
             await conn.run_sync(Base.metadata.create_all)
 
         await self.download_and_check_audit_reports()
-        return
-
-        await self.load_invocations("reports/invocations/2025/02/03/17.csv")
         return
 
         # try:
