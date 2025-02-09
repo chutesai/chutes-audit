@@ -7,23 +7,26 @@ import yaml
 import orjson as json
 import asyncio
 import tempfile
+import hashlib
 from pathlib import Path
 import numpy as np
 import pybase64 as base64
 import sounddevice as sd
 import soundfile as sf
+from functools import lru_cache
 from datetime import datetime
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
 from typing import AsyncGenerator
 from pydantic import BaseModel
+from substrateinterface import SubstrateInterface
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, String, DateTime, Double, Integer, Boolean, BigInteger, func, select
 from munch import munchify
 from datasets import load_dataset
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 # Database configuration.
 engine = create_async_engine(
@@ -38,6 +41,9 @@ SessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 Base = declarative_base()
+
+
+class IntegrityViolation(RuntimeError): ...
 
 
 @asynccontextmanager
@@ -140,10 +146,23 @@ class Auditor:
                 self.image_prompts = load_dataset(
                     image_config.dataset.name, **dict(image_config.dataset.options)
                 )
+        self.validators = {v.hotkey: v for v in self.config.validators}
         self._slock = asyncio.Lock()
         self._asession = None
         self._running = True
         self.chutes = {}
+        self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
+
+    @contextmanager
+    def substrate(self):
+        """
+        Yield the substrate interface, reconnecting on error.
+        """
+        try:
+            yield self._substrate
+        except Exception as exc:
+            self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
+            raise
 
     @asynccontextmanager
     async def aiosession(self) -> aiohttp.ClientSession:
@@ -564,6 +583,55 @@ class Auditor:
             await session.commit()
         logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
 
+    @lru_cache(maxsize=1024)
+    def get_block_hash(self, block):
+        """
+        Get a block (number) hash.
+        """
+        with self.substrate() as substrate:
+            return substrate.get_block_hash(block)
+
+    def get_block_commit(self, block, who):
+        """
+        Given a block number, fetch all set_commitment events.
+        """
+        logger.info(f"Attempting to process {block=}")
+        with self.substrate() as substrate:
+            block_hash = self.get_block_hash(block)
+            commitment = substrate.query(
+                module='Commitments',
+                storage_function='CommitmentOf',
+                params=[64, who],
+                block_hash=block_hash,
+            )
+            if commitment:
+                for c in commitment.value.get("info", {}).get("fields"):
+                    if "Sha256" in c:
+                        return c["Sha256"][2:]
+        logger.warning(f"Failed to get commit sha256 for {block=} from {who}")
+        return None
+
+    def check_audit_report_integrity(self, record, path, content):
+        """
+        Check a single audit report's sha256 compared to the set_commitment call's checksum.
+        """
+        calculated = hashlib.sha256(content).hexdigest()
+        committed = self.get_block_commit(record.block, record.hotkey)
+        if not committed:
+            logger.warning(f"Could not find commitment for hotkey {db_record.hotkey} on netuid 64 in block {record.block}")
+            if record.hotkey in self.validators:
+                return False
+            return True
+        if committed != calculated:
+            if record.hotkey in self.validators:
+                logger.error(f"Validator committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}")
+                return False
+            else:
+                logger.warning(f"Miner committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}")
+                # Miners could try to be malicous here so we'll treat this as a warning (perhaps we can set lower weights too?)
+        logger.success(f"Verified commitment from {record.hotkey} in block {record.block} matches sha256: {calculated}")
+        return True
+
     async def check_audit_reports(self):
         """
         Fetch and verify all audit reports.
@@ -576,11 +644,10 @@ class Auditor:
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
-        new_records = []
         for _id, record in by_id.items():
             if _id in existing_ids:
                 continue
-            record = AuditEntry(
+            db_record = AuditEntry(
                 entry_id=record["entry_id"],
                 hotkey=record["hotkey"],
                 block=record["block"],
@@ -589,25 +656,65 @@ class Auditor:
                 start_time=datetime.fromisoformat(record["start_time"].rstrip("Z")),
                 end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")),
             )
-            new_records.append(record)
             logger.info(
-                f"Need to verify new audit entry: {record.entry_id} "
-                f"for data between {record.start_time} and {record.end_time}"
+                f"Need to verify new audit entry: {db_record.entry_id} "
+                f"for data between {db_record.start_time} and {db_record.end_time}"
             )
-            path = Path(os.path.join("reports", record.path)).resolve()
+
+            # Download the report locally.
+            path = Path(os.path.join("reports", db_record.path)).resolve()
             try:
                 path.relative_to(os.path.dirname(os.path.abspath(__file__)))
             except ValueError:
-                raise ValueError(f"Path {record.path} attempts to escape base directory!")
+                raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
             path.parent.mkdir(parents=True, exist_ok=True)
+            audit_content = None
+            expected_checksum = None
             async with self.aiosession() as session:
                 async with session.get(
-                    "https://api.chutes.ai/audit/download", params={"path": record.path}
+                    "https://api.chutes.ai/audit/download", params={"path": db_record.path}
                 ) as resp:
                     with open(path, "wb") as outfile:
-                        outfile.write(await resp.read())
-            logger.success(f"Successfully download {record.path} committed in block {record.block}")
-            break
+                        audit_content = await resp.read()
+                        outfile.write(audit_content)
+                        data = json.loads(audit_content)
+
+                    # Also need to download the CSV reports if it's from a validator.
+                    if db_record.hotkey in self.validators:
+                        vali_url = self.validators[db_record.hotkey]["url"]
+                        inv = data.get("csv_exports", {}).get("invocations")
+                        if inv:
+                            logger.info(f"Downloading and verifying CSV export of invocations: {inv['path']}")
+                            remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
+                            local_path = Path(os.path.join("reports", inv["path"])).resolve()
+                            try:
+                                path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+                            except ValueError:
+                                raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
+                            local_path.parent.mkdir(parents=True, exist_ok=True)
+                            async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
+                                csv_content = await csv_resp.read()
+                                calculated = hashlib.sha256(csv_content).hexdigest()
+                                print(f"Comparing: {calculated} to {inv}")
+                                if calculated != inv["sha256"]:
+                                    raise IntegrityViolation(f"CSV export {remote_path} of validator: {vali_url} does not match!")
+                                with open(path, "wb") as outfile:
+                                    outfile.write(csv_content)
+                                logger.success(f"Successfully downloaded CSV report data from {remote_path}")
+
+            # Now we can compare the sha256 of the report to the commitment on chain.
+            logger.success(
+                f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
+                f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
+            )
+            if not self.check_audit_report_integrity(db_record, path, audit_content):
+                raise IntegrityViolation(f"Commitment on chain does not match downloaded report! {record}")
+
+            # Persist the record to DB.
+            async with get_session() as session:
+                session.add(db_record)
+                await session.commit()
+                logger.success(f"Successfully verified and persisted {record}")
 
     async def perform_synthetics(self):
         """
