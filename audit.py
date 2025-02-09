@@ -8,6 +8,7 @@ import orjson as json
 import asyncio
 import tempfile
 import hashlib
+import backoff
 from pathlib import Path
 import numpy as np
 import pybase64 as base64
@@ -632,6 +633,66 @@ class Auditor:
         logger.success(f"Verified commitment from {record.hotkey} in block {record.block} matches sha256: {calculated}")
         return True
 
+    @backoff.on_exception(
+        backoff.constant,
+        Exception,
+        jitter=None,
+        interval=10,
+        max_tries=7,
+    )
+    async def download_and_check_one(self, db_record):
+        """
+        Download and verify a single audit report (and the associated CSV exports if from validator).
+        """
+        # Download the report locally.
+        path = Path(os.path.join("reports", db_record.path)).resolve()
+        try:
+            path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+        except ValueError:
+            raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        audit_content = None
+        expected_checksum = None
+        async with self.aiosession() as session:
+            async with session.get(
+                "https://api.chutes.ai/audit/download", params={"path": db_record.path}
+            ) as resp:
+                with open(path, "wb") as outfile:
+                    audit_content = await resp.read()
+                    outfile.write(audit_content)
+                    data = json.loads(audit_content)
+
+                # Also need to download the CSV reports if it's from a validator.
+                if db_record.hotkey in self.validators:
+                    vali_url = self.validators[db_record.hotkey]["url"]
+                    inv = data.get("csv_exports", {}).get("invocations")
+                    if inv:
+                        logger.info(f"Downloading and verifying CSV export of invocations: {inv['path']}")
+                        remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
+                        local_path = Path(os.path.join("reports", inv["path"])).resolve()
+                        try:
+                            path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+                        except ValueError:
+                            raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
+                            csv_content = await csv_resp.read()
+                            calculated = hashlib.sha256(csv_content).hexdigest()
+                            print(f"Comparing: {calculated} to {inv}")
+                            if calculated != inv["sha256"]:
+                                raise IntegrityViolation(f"CSV export {remote_path} of validator: {vali_url} does not match!")
+                            with open(path, "wb") as outfile:
+                                outfile.write(csv_content)
+                            logger.success(f"Successfully downloaded CSV report data from {remote_path}")
+
+        # Now we can compare the sha256 of the report to the commitment on chain.
+        logger.success(
+            f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
+            f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
+        )
+        if not self.check_audit_report_integrity(db_record, path, audit_content):
+            raise IntegrityViolation(f"Commitment on chain does not match downloaded report! {record}")
+
     async def check_audit_reports(self):
         """
         Fetch and verify all audit reports.
@@ -661,60 +722,14 @@ class Auditor:
                 f"for data between {db_record.start_time} and {db_record.end_time}"
             )
 
-            # Download the report locally.
-            path = Path(os.path.join("reports", db_record.path)).resolve()
-            try:
-                path.relative_to(os.path.dirname(os.path.abspath(__file__)))
-            except ValueError:
-                raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            audit_content = None
-            expected_checksum = None
-            async with self.aiosession() as session:
-                async with session.get(
-                    "https://api.chutes.ai/audit/download", params={"path": db_record.path}
-                ) as resp:
-                    with open(path, "wb") as outfile:
-                        audit_content = await resp.read()
-                        outfile.write(audit_content)
-                        data = json.loads(audit_content)
-
-                    # Also need to download the CSV reports if it's from a validator.
-                    if db_record.hotkey in self.validators:
-                        vali_url = self.validators[db_record.hotkey]["url"]
-                        inv = data.get("csv_exports", {}).get("invocations")
-                        if inv:
-                            logger.info(f"Downloading and verifying CSV export of invocations: {inv['path']}")
-                            remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
-                            local_path = Path(os.path.join("reports", inv["path"])).resolve()
-                            try:
-                                path.relative_to(os.path.dirname(os.path.abspath(__file__)))
-                            except ValueError:
-                                raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
-                            local_path.parent.mkdir(parents=True, exist_ok=True)
-                            async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
-                                csv_content = await csv_resp.read()
-                                calculated = hashlib.sha256(csv_content).hexdigest()
-                                print(f"Comparing: {calculated} to {inv}")
-                                if calculated != inv["sha256"]:
-                                    raise IntegrityViolation(f"CSV export {remote_path} of validator: {vali_url} does not match!")
-                                with open(path, "wb") as outfile:
-                                    outfile.write(csv_content)
-                                logger.success(f"Successfully downloaded CSV report data from {remote_path}")
-
-            # Now we can compare the sha256 of the report to the commitment on chain.
-            logger.success(
-                f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
-                f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
-            )
-            if not self.check_audit_report_integrity(db_record, path, audit_content):
-                raise IntegrityViolation(f"Commitment on chain does not match downloaded report! {record}")
+            # Download the report data locally and verify the integrity against commitment calls.
+            await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:
                 session.add(db_record)
                 await session.commit()
-                logger.success(f"Successfully verified and persisted {record}")
+                logger.success(f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}")
 
     async def perform_synthetics(self):
         """
