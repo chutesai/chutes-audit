@@ -2,6 +2,7 @@ import io
 import os
 import re
 import csv
+import ast
 import uuid
 import shutil
 import random
@@ -778,6 +779,10 @@ class Auditor:
                     )
                 else:
                     row_data["completed_at"] = None
+                if row.get("metrics"):
+                    row_data["metrics"] = json.dumps(ast.literal_eval(row["metrics"])).decode()
+                else:
+                    row_data["metrics"] = None
                 batch.append(row_data)
                 total += 1
                 if len(batch) == 100:
@@ -857,7 +862,7 @@ class Auditor:
                 )
         if total:
             logger.success(
-                f"Populated {total} sefl-reported chute metric records for {record.hotkey} in {record.entry_id=}"
+                f"Populated {total} self-reported chute metric records for {record.hotkey} in {record.entry_id=}"
             )
         else:
             logger.info(
