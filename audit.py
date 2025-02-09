@@ -1,6 +1,9 @@
 import io
 import os
 import re
+import csv
+import uuid
+import shutil
 import random
 import aiohttp
 import yaml
@@ -15,7 +18,7 @@ import pybase64 as base64
 import sounddevice as sd
 import soundfile as sf
 from functools import lru_cache
-from datetime import datetime
+from datetime import datetime, timedelta
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
@@ -24,7 +27,21 @@ from pydantic import BaseModel
 from substrateinterface import SubstrateInterface
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, String, DateTime, Double, Integer, Boolean, BigInteger, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    Column,
+    String,
+    DateTime,
+    Double,
+    Integer,
+    Boolean,
+    BigInteger,
+    func,
+    select,
+    ForeignKey,
+    text,
+)
 from munch import munchify
 from datasets import load_dataset
 from contextlib import asynccontextmanager, contextmanager
@@ -65,31 +82,52 @@ class Invocation(Base):
     parent_invocation_id = Column(String)
     invocation_id = Column(String, primary_key=True)
     chute_id = Column(String)
+    chute_user_id = Column(String)
     function_name = Column(String)
     user_id = Column(String)
     image_id = Column(String)
+    image_user_id = Column(String)
     instance_id = Column(String)
-    miner_uid = Column(String)
+    miner_uid = Column(Integer)
     miner_hotkey = Column(String)
     error_message = Column(String)
     compute_multiplier = Column(Double)
     bounty = Column(Integer)
+    metrics = Column(JSONB, nullable=True)
     started_at = Column(DateTime(timezone=True))
-    completed_at = Column(DateTime(timezone=True))
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class InstanceAudit(Base):
-    __tablename__ = "instance_audit"
-    instance_id = Column(String, primary_key=True)
+    __tablename__ = "instance_audits"
+    audit_id = Column(String, primary_key=True)
+    entry_id = Column(String, ForeignKey("audit_entries.entry_id", ondelete="CASCADE"))
+    instance_id = Column(String)
+    source = Column(String)
+    deployment_id = Column(String)
+    validator = Column(String)
     chute_id = Column(String)
     version = Column(String)
     deletion_reason = Column(String)
-    miner_uid = Column(String)
+    miner_uid = Column(Integer)
     miner_hotkey = Column(String)
-    region = Column(String)  # not actually used right now, perhaps soon
+    region = Column(String)
     created_at = Column(DateTime(timezone=True))
     verified_at = Column(DateTime(timezone=True))
     deleted_at = Column(DateTime(timezone=True))
+
+
+class MinerMetric(Base):
+    __tablename__ = "miner_metrics"
+    entry_id = Column(
+        String, ForeignKey("audit_entries.entry_id", ondelete="CASCADE"), primary_key=True
+    )
+    deployment_id = Column(String, primary_key=True)
+    function = Column(String, primary_key=True)
+    hotkey = Column(String)
+    chute_id = Column(String)
+    total_seconds = Column(Double)
+    total_count = Column(Integer)
 
 
 class AuditEntry(Base):
@@ -161,7 +199,7 @@ class Auditor:
         """
         try:
             yield self._substrate
-        except Exception as exc:
+        except Exception:
             self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
             raise
 
@@ -600,8 +638,8 @@ class Auditor:
         with self.substrate() as substrate:
             block_hash = self.get_block_hash(block)
             commitment = substrate.query(
-                module='Commitments',
-                storage_function='CommitmentOf',
+                module="Commitments",
+                storage_function="CommitmentOf",
                 params=[64, who],
                 block_hash=block_hash,
             )
@@ -619,18 +657,26 @@ class Auditor:
         calculated = hashlib.sha256(content).hexdigest()
         committed = self.get_block_commit(record.block, record.hotkey)
         if not committed:
-            logger.warning(f"Could not find commitment for hotkey {db_record.hotkey} on netuid 64 in block {record.block}")
+            logger.warning(
+                f"Could not find commitment for hotkey {record.hotkey} on netuid 64 in block {record.block}"
+            )
             if record.hotkey in self.validators:
                 return False
             return True
         if committed != calculated:
             if record.hotkey in self.validators:
-                logger.error(f"Validator committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}")
+                logger.error(
+                    f"Validator committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}"
+                )
                 return False
             else:
-                logger.warning(f"Miner committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}")
+                logger.warning(
+                    f"Miner committed checksum does not match calculated checksum: {calculated} vs {committed} -> {record}"
+                )
                 # Miners could try to be malicous here so we'll treat this as a warning (perhaps we can set lower weights too?)
-        logger.success(f"Verified commitment from {record.hotkey} in block {record.block} matches sha256: {calculated}")
+        logger.success(
+            f"Verified commitment from {record.hotkey} in block {record.block} matches sha256: {calculated}"
+        )
         return True
 
     @backoff.on_exception(
@@ -640,19 +686,20 @@ class Auditor:
         interval=10,
         max_tries=7,
     )
-    async def download_and_check_one(self, db_record):
+    async def download_and_check_one(self, db_record) -> str:
         """
         Download and verify a single audit report (and the associated CSV exports if from validator).
         """
         # Download the report locally.
-        path = Path(os.path.join("reports", db_record.path)).resolve()
+        path = Path(os.path.join("reports", db_record.entry_id, db_record.path)).resolve()
         try:
             path.relative_to(os.path.dirname(os.path.abspath(__file__)))
         except ValueError:
             raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
         path.parent.mkdir(parents=True, exist_ok=True)
         audit_content = None
-        expected_checksum = None
+        csv_path = None
+        data = None
         async with self.aiosession() as session:
             async with session.get(
                 "https://api.chutes.ai/audit/download", params={"path": db_record.path}
@@ -667,23 +714,32 @@ class Auditor:
                     vali_url = self.validators[db_record.hotkey]["url"]
                     inv = data.get("csv_exports", {}).get("invocations")
                     if inv:
-                        logger.info(f"Downloading and verifying CSV export of invocations: {inv['path']}")
+                        logger.info(
+                            f"Downloading and verifying CSV export of invocations: {inv['path']}"
+                        )
                         remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
-                        local_path = Path(os.path.join("reports", inv["path"])).resolve()
+                        csv_path = Path(
+                            os.path.join("reports", db_record.entry_id, inv["path"])
+                        ).resolve()
                         try:
                             path.relative_to(os.path.dirname(os.path.abspath(__file__)))
                         except ValueError:
-                            raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
-                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                            raise ValueError(
+                                f"Path {db_record.path} attempts to escape base directory!"
+                            )
+                        csv_path.parent.mkdir(parents=True, exist_ok=True)
                         async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
                             csv_content = await csv_resp.read()
                             calculated = hashlib.sha256(csv_content).hexdigest()
-                            print(f"Comparing: {calculated} to {inv}")
                             if calculated != inv["sha256"]:
-                                raise IntegrityViolation(f"CSV export {remote_path} of validator: {vali_url} does not match!")
-                            with open(path, "wb") as outfile:
+                                raise IntegrityViolation(
+                                    f"CSV export {remote_path} of validator: {vali_url} does not match!"
+                                )
+                            with open(csv_path, "wb") as outfile:
                                 outfile.write(csv_content)
-                            logger.success(f"Successfully downloaded CSV report data from {remote_path}")
+                            logger.success(
+                                f"Successfully downloaded CSV report data from {remote_path}"
+                            )
 
         # Now we can compare the sha256 of the report to the commitment on chain.
         logger.success(
@@ -691,9 +747,112 @@ class Auditor:
             f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
         )
         if not self.check_audit_report_integrity(db_record, path, audit_content):
-            raise IntegrityViolation(f"Commitment on chain does not match downloaded report! {record}")
+            raise IntegrityViolation(
+                f"Commitment on chain does not match downloaded report! {db_record.record_id}"
+            )
+        return data, csv_path
 
-    async def check_audit_reports(self):
+    async def load_invocations(self, session, csv_path):
+        """
+        Populate our local database with invocations from the CSV exports.
+        """
+        logger.info(f"Inserting invocation records from {csv_path}")
+        total = 0
+        with open(csv_path, "r") as infile:
+            reader = csv.DictReader(infile)
+            batch = []
+            for row in reader:
+                row_data = dict(row)
+                row_data.update(
+                    {
+                        "miner_uid": int(row["miner_uid"]),
+                        "compute_multiplier": float(row["compute_multiplier"]),
+                        "bounty": int(row["bounty"]),
+                        "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")),
+                    }
+                )
+                if row["completed_at"]:
+                    row_data.update(
+                        {"completed_at": datetime.fromisoformat(row["completed_at"].rstrip("Z"))}
+                    )
+                else:
+                    row_data["completed_at"] = None
+                batch.append(row_data)
+                total += 1
+                if len(batch) == 100:
+                    bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
+                    await session.execute(bulk_insert)
+                    batch = []
+            if batch:
+                bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
+                await session.execute(bulk_insert)
+            await session.commit()
+        if total:
+            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+
+    async def load_audit_entries(self, record, audit_data):
+        """
+        Load the deployment audit history from the report.
+        """
+        key = "instance_audit" if record.hotkey in self.validators else "deployment_audit"
+        total = 0
+        for item in audit_data.get(key, []):
+            try:
+                item["audit_id"] = str(uuid.uuid5(uuid.NAMESPACE_OID, json.dumps(item).decode()))
+                item["entry_id"] = record.entry_id
+                audit = InstanceAudit(**item)
+                audit.source = "validator" if record.hotkey in self.validators else "miner"
+                audit.created_at = datetime.fromisoformat(audit.created_at.rstrip("Z"))
+                if audit.verified_at:
+                    audit.verified_at = datetime.fromisoformat(audit.verified_at.rstrip("Z"))
+                if audit.deleted_at:
+                    audit.deleted_at = datetime.fromisoformat(audit.deleted_at.rstrip("Z"))
+                if audit.miner_uid is not None:
+                    audit.miner_uid = int(audit.miner_uid)
+                async with get_session() as session:
+                    session.add(audit)
+                    await session.commit()
+                total += 1
+            except Exception as exc:
+                logger.error(
+                    f"Error populating instance audit data from {record.hotkey} {record.entry_id=}: {exc}"
+                )
+                logger.error(item)
+        if total:
+            logger.success(
+                f"Populated {total} instance audit records for {record.hotkey} in {record.entry_id=}"
+            )
+        else:
+            logger.info(
+                f"No new instance audit records to process for {record.hotkey} in {record.entry_id=}"
+            )
+
+    async def load_miner_metrics(self, record, audit_data):
+        """
+        Load the miner-reported metrics for a given report.
+        """
+        total = 0
+        for item in audit_data.get("prometheus_metrics", []):
+            try:
+                async with get_session() as session:
+                    item["entry_id"] = record.entry_id
+                    session.add(MinerMetric(**item))
+                    await session.commit()
+                    total += 1
+            except Exception as exc:
+                logger.error(
+                    f"Error populating miner-reported metrics from {record.hotkey} {record.entry_id=}: {exc}"
+                )
+        if total:
+            logger.success(
+                f"Populated {total} sefl-reported chute metric records for {record.hotkey} in {record.entry_id=}"
+            )
+        else:
+            logger.info(
+                f"No self-reported chute metric records for {record.hotkey} in {record.entry_id=}"
+            )
+
+    async def download_and_check_audit_reports(self):
         """
         Fetch and verify all audit reports.
         """
@@ -701,13 +860,33 @@ class Auditor:
             async with session.get("https://api.chutes.ai/audit/") as resp:
                 audit_records = await resp.json()
                 by_id = {record["entry_id"]: record for record in audit_records}
+
+        # Clean up the old data, plus get a list of existing items to skip.
+        delete_directories = []
         async with get_session() as session:
+            query = select(AuditEntry).where(
+                AuditEntry.created_at <= func.now() - timedelta(days=7, hours=1)
+            )
+            result = await session.execute(query)
+            for entry in result:
+                await session.delete(entry)
+                delete_directories.append("reports/{entry.entry_id}")
+            await session.execute(
+                text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
+            )
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
+        for directory in delete_directories:
+            logger.info("Purging old data: {directory}")
+            shutil.rmtree(directory, ignore_errors=True)
+
+        # Now load all new audit records.
+        total = 0
         for _id, record in by_id.items():
             if _id in existing_ids:
                 continue
+            total += 1
             db_record = AuditEntry(
                 entry_id=record["entry_id"],
                 hotkey=record["hotkey"],
@@ -723,13 +902,35 @@ class Auditor:
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            await self.download_and_check_one(db_record)
+            audit_data, csv_path = await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:
                 session.add(db_record)
                 await session.commit()
-                logger.success(f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}")
+                logger.success(
+                    f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}"
+                )
+                # Load CSV invocation data if it's from a validator.
+                if csv_path:
+                    await self.load_invocations(session, csv_path)
+
+                # Persist the actual audit entry data.
+                await self.load_audit_entries(db_record, audit_data)
+
+                # Load miner-reported metrics.
+                if db_record.hotkey not in self.validators:
+                    try:
+                        await self.load_miner_metrics(db_record, audit_data)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Error loading miner metrics in {db_record.entry_id=} for {db_record.hotkey}: {exc}"
+                        )
+
+        if not total:
+            logger.info("No new audit data to process.")
+        else:
+            logger.success(f"Successfully processed {total} new audit reports.")
 
     async def perform_synthetics(self):
         """
@@ -746,7 +947,10 @@ class Auditor:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        await self.check_audit_reports()
+        await self.download_and_check_audit_reports()
+        return
+
+        await self.load_invocations("reports/invocations/2025/02/03/17.csv")
         return
 
         # try:
