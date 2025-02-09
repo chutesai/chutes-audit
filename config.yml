@@ -50,3 +50,6 @@ validators:
 - name: Chutes
   hotkey: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
   url: https://api.chutes.ai
+
+# Subtensor node to query.
+subtensor: wss://entrypoint-finney.opentensor.ai
