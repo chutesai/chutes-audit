@@ -27,7 +27,7 @@ from fiber.chain import fetch_nodes
 from fiber.networking.models import NodeWithFernet as Node
 from fiber.chain.chain_utils import query_substrate
 from functools import lru_cache
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
@@ -1124,7 +1124,7 @@ class Auditor:
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
                 await session.delete(entry)
-                delete_directories.append("reports/{entry.entry_id}")
+                delete_directories.append(f"reports/{entry.entry_id}")
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
@@ -1298,29 +1298,16 @@ class Auditor:
         while self._running:
             if not await self.download_and_check_audit_reports():
                 # No new data, let's see how long we should wait before trying again.
-                wait_time = 60
                 async with get_session() as session:
                     most_recent = (
                         await session.execute(
                             select(AuditEntry).order_by(AuditEntry.start_time.desc()).limit(1)
                         )
                     ).scalar_one_or_none()
-                if most_recent:
-                    now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    delta = int((now - most_recent.end_time).total_seconds())
-                    wait_time = (60 * 60 + 30) - delta
-                    if wait_time < 0:
-                        logger.warning(
-                            "It seems the audit data is lagging behind and/or is not being gnerated - this is a problem!"
-                        )
-                        wait_time = 60
-                    else:
-                        logger.info(
-                            f"The most recent report end time is from {delta} seconds ago, waiting {wait_time} seconds before retrying..."
-                        )
-                else:
+                if not most_recent:
                     # This is basically impossible?
                     logger.warning("Should not be here, why???")
+
                 if first_run and most_recent:
                     logger.info(
                         "No new audit data, but here is the most recent weight data output from the "
@@ -1328,8 +1315,6 @@ class Auditor:
                     )
                     self.compare_weights_to_actual(await self.get_weights_to_set())
                     await self.compare_miner_metrics()
-
-                await asyncio.sleep(wait_time)
             else:
                 if self.config.set_weights.enabled:
                     await self.get_and_set_weights()
@@ -1340,7 +1325,7 @@ class Auditor:
                 # Compare the validator stats to miner self-reported stats.
                 await self.compare_miner_metrics()
 
-                await asyncio.sleep(10)
+            await asyncio.sleep(60)
             first_run = False
 
     async def verify_integrity_and_set_weights(self):
