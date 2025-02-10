@@ -19,6 +19,12 @@ import numpy as np
 import pybase64 as base64
 import sounddevice as sd
 import soundfile as sf
+from typing import Optional
+from fiber import Keypair
+from fiber.chain import weights
+from fiber.chain import fetch_nodes
+from fiber.networking.models import NodeWithFernet as Node
+from fiber.chain.chain_utils import query_substrate
 from functools import lru_cache
 from datetime import datetime, timedelta
 from langdetect import detect as detect_language
@@ -62,6 +68,54 @@ SessionLocal = sessionmaker(
 )
 Base = declarative_base()
 
+# Query and score weighting values to use for calculating incentive/setting weights.
+VERSION_KEY = 69420
+FEATURE_WEIGHTS = {
+    "compute_units": 0.35,  # Total amount of compute time (compute muliplier * total time).
+    "invocation_count": 0.3,  # Total number of invocations.
+    "unique_chute_count": 0.25,  # Number of unique chutes over the scoring period.
+    "bounty_count": 0.1,  # Number of bounties received (not bounty values, just counts).
+}
+MINER_METRICS_QUERY = """
+WITH computation_rates AS (
+    SELECT
+        chute_id,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / (metrics->>'steps')::float) as median_step_time,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / (metrics->>'tokens')::float) as median_token_time
+    FROM invocations
+    WHERE ((metrics->>'steps' IS NOT NULL and (metrics->>'steps')::float > 0) OR (metrics->>'tokens' IS NOT NULL and (metrics->>'tokens')::float > 0)) AND started_at >= (now() AT TIME ZONE 'UTC') - interval '2 days'
+    GROUP BY chute_id
+)
+SELECT
+    i.miner_hotkey,
+    COUNT(*) as invocation_count,
+    COUNT(DISTINCT(i.chute_id)) AS unique_chute_count,
+    COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
+    sum(
+        i.bounty +
+        i.compute_multiplier *
+        CASE
+            WHEN i.metrics->>'steps' IS NOT NULL
+                AND r.median_step_time IS NOT NULL
+                AND EXTRACT(EPOCH FROM (i.completed_at - i.started_at)) > ((i.metrics->>'steps')::float * r.median_step_time)
+            THEN (i.metrics->>'steps')::float * r.median_step_time
+            WHEN i.metrics->>'tokens' IS NOT NULL
+                AND r.median_token_time IS NOT NULL
+                AND EXTRACT(EPOCH FROM (i.completed_at - i.started_at)) > ((i.metrics->>'tokens')::float * r.median_token_time)
+            THEN (i.metrics->>'tokens')::float * r.median_token_time
+            ELSE EXTRACT(EPOCH FROM (i.completed_at - i.started_at))
+        END
+    ) AS compute_units
+FROM invocations i
+LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
+WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
+    AND (i.error_message IS NULL or i.error_message = '')
+    AND i.miner_uid > 0
+    AND i.completed_at IS NOT NULL
+GROUP BY i.miner_hotkey
+ORDER BY compute_units DESC;
+"""
+
 
 class IntegrityViolation(RuntimeError): ...
 
@@ -96,8 +150,8 @@ class Invocation(Base):
     compute_multiplier = Column(Double)
     bounty = Column(Integer)
     metrics = Column(JSONB, nullable=True)
-    started_at = Column(DateTime(timezone=True))
-    completed_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=False))
+    completed_at = Column(DateTime(timezone=False), nullable=True)
 
 
 class InstanceAudit(Base):
@@ -114,9 +168,9 @@ class InstanceAudit(Base):
     miner_uid = Column(Integer)
     miner_hotkey = Column(String)
     region = Column(String)
-    created_at = Column(DateTime(timezone=True))
-    verified_at = Column(DateTime(timezone=True))
-    deleted_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=False))
+    verified_at = Column(DateTime(timezone=False))
+    deleted_at = Column(DateTime(timezone=False))
 
 
 class MinerMetric(Base):
@@ -138,9 +192,9 @@ class AuditEntry(Base):
     hotkey = Column(String)
     block = Column(BigInteger)
     path = Column(String)
-    created_at = Column(DateTime(timezone=True))
-    start_time = Column(DateTime(timezone=True))
-    end_time = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=False))
+    start_time = Column(DateTime(timezone=False))
+    end_time = Column(DateTime(timezone=False))
 
 
 class Synthetic(Base):
@@ -151,7 +205,7 @@ class Synthetic(Base):
     chute_id = Column(String)
     miner_uid = Column(String)
     miner_hotkey = Column(String)
-    created_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=False))
     has_error = Column(Boolean, default=False)
 
 
@@ -193,6 +247,13 @@ class Auditor:
         self._running = True
         self.chutes = {}
         self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
+
+        # Keypair -- only set if you are a registered validator.
+        self.ss58_address = None
+        self.keypair = None
+        if self.config.set_weights.enabled:
+            self.ss58_address = self.config.set_weights.s58_address
+            self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
 
     @contextmanager
     def substrate(self):
@@ -424,7 +485,7 @@ class Auditor:
                                     chute_id=chute.chute_id,
                                     miner_uid=target.uid,
                                     miner_hotkey=target.hotkey,
-                                    created_at=func.now(),
+                                    created_at=func.timezone("UTC", func.now()),
                                     has_error=False,
                                 )
                             )
@@ -770,17 +831,29 @@ class Auditor:
                         "miner_uid": int(row["miner_uid"]),
                         "compute_multiplier": float(row["compute_multiplier"]),
                         "bounty": int(row["bounty"]),
-                        "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")),
+                        "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
+                            tzinfo=None
+                        ),
                     }
                 )
                 if row["completed_at"]:
                     row_data.update(
-                        {"completed_at": datetime.fromisoformat(row["completed_at"].rstrip("Z"))}
+                        {
+                            "completed_at": datetime.fromisoformat(
+                                row["completed_at"].rstrip("Z")
+                            ).replace(tzinfo=None)
+                        }
                     )
                 else:
                     row_data["completed_at"] = None
+                for key in row_data:
+                    if isinstance(row_data[key], str) and not row_data[key].strip():
+                        row_data[key] = None
                 if row.get("metrics"):
-                    row_data["metrics"] = json.dumps(ast.literal_eval(row["metrics"])).decode()
+                    try:
+                        row_data["metrics"] = ast.literal_eval(row["metrics"])
+                    except ValueError as exc:
+                        logger.warning(f"Error parsing metrics: {exc}: {row['metrics']}")
                 else:
                     row_data["metrics"] = None
                 batch.append(row_data)
@@ -819,11 +892,17 @@ class Auditor:
                 item["entry_id"] = record.entry_id
                 audit = InstanceAudit(**item)
                 audit.source = "validator" if record.hotkey in self.validators else "miner"
-                audit.created_at = datetime.fromisoformat(audit.created_at.rstrip("Z"))
+                audit.created_at = datetime.fromisoformat(audit.created_at.rstrip("Z")).replace(
+                    tzinfo=None
+                )
                 if audit.verified_at:
-                    audit.verified_at = datetime.fromisoformat(audit.verified_at.rstrip("Z"))
+                    audit.verified_at = datetime.fromisoformat(
+                        audit.verified_at.rstrip("Z")
+                    ).replace(tzinfo=None)
                 if audit.deleted_at:
-                    audit.deleted_at = datetime.fromisoformat(audit.deleted_at.rstrip("Z"))
+                    audit.deleted_at = datetime.fromisoformat(audit.deleted_at.rstrip("Z")).replace(
+                        tzinfo=None
+                    )
                 if audit.miner_uid is not None:
                     audit.miner_uid = int(audit.miner_uid)
                 async with get_session() as session:
@@ -869,6 +948,131 @@ class Auditor:
                 f"No self-reported chute metric records for {record.hotkey} in {record.entry_id=}"
             )
 
+    async def get_weights_to_set(
+        self, hotkeys_to_node_ids: Optional[dict[str, int]] = None,
+    ) -> tuple[list[int], list[float]] | None:
+        """
+        Get weights to set from the invocation data.
+        """
+
+        if not hotkeys_to_node_ids:
+            with self.substrate() as substrate:
+                all_nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
+                hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
+
+        query = text(MINER_METRICS_QUERY)
+        raw_compute_values = {}
+        header = [
+            "hotkey",
+            "invocation_count",
+            "unique_chute_count",
+            "bounty_count",
+            "compute_units",
+        ]
+        async with get_session() as session:
+            result = await session.execute(query)
+            for row in result:
+                obj = dict(zip(header, row))
+                raw_compute_values[obj["hotkey"]] = obj
+                logger.info(obj)
+
+        # Normalize the values based on totals so they are all in the range [0.0, 1.0]
+        totals = {
+            key: sum(row[key] for row in raw_compute_values.values()) or 1.0 for key in header[1:]
+        }
+        normalized_values = {
+            hotkey: {key: row[key] / totals[key] for key in header[1:]}
+            for hotkey, row in raw_compute_values.items()
+        }
+
+        # Adjust the values by the feature weights, e.g. compute_time gets more weight than bounty count.
+        final_scores = {
+            hotkey: sum(norm_value * FEATURE_WEIGHTS[key] for key, norm_value in metrics.items())
+            for hotkey, metrics in normalized_values.items()
+        }
+
+        # Final weights per node.
+        node_ids = []
+        node_weights = []
+        for hotkey, compute_score in final_scores.items():
+            if hotkey not in hotkeys_to_node_ids:
+                logger.debug(f"Miner {hotkey} not found on metagraph. Ignoring.")
+                continue
+
+            node_weights.append(compute_score)
+            node_ids.append(hotkeys_to_node_ids[hotkey])
+            logger.info(f"Normalized score for {hotkey}: {compute_score}")
+
+        return node_ids, node_weights
+
+    async def get_and_set_weights(self):
+        """
+        When enabled, and you have a validator registered on the subnet, calculate and set weights from audit data.
+        """
+        if not self.config.set_weights.enabled or not self.ss58_address:
+            logger.warning("Refusing to attempt setting weights, not enabled in config!")
+            return False
+
+        with self.substrate() as substrate:
+            substrate, uid = query_substrate(
+                substrate, "SubtensorModule", "Uids", [64, self.ss58_address], return_value=True
+            )
+            if not uid:
+                logger.warning(
+                    "Validator node id not found on the metagraph, are you sure "
+                    f"hotkey {self.ss58_address} is registered on subnet 64?"
+                )
+                return False
+
+            # Load the nodes from the metagraph.
+            all_nodes: list[Node] = fetch_nodes.get_nodes_for_netuid(substrate, 64)
+            hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
+
+            # Query the audit data for weights to set.
+            result = await self.get_weights_to_set(hotkeys_to_node_ids)
+            if result is None:
+                logger.warning("No weights to set. Skipping weight setting.")
+                return
+            node_ids, node_weights = result
+            if len(node_ids) == 0:
+                logger.warning("No nodes to set weights for. Skipping weight setting.")
+                return False
+
+            # Set weights!
+            logger.info("Weights calculated, about to set...")
+            all_node_ids = [node.node_id for node in all_nodes]
+            all_node_weights = [0.0 for _ in all_nodes]
+            for node_id, node_weight in zip(node_ids, node_weights):
+                all_node_weights[node_id] = node_weight
+
+            logger.info(f"Node ids: {all_node_ids}")
+            logger.info(f"Node weights: {all_node_weights}")
+            logger.info(
+                f"Number of non zero node weights: {sum(1 for weight in all_node_weights if weight != 0)}"
+            )
+            try:
+                success = weights.set_node_weights(
+                    substrate=substrate,
+                    keypair=self.keypair,
+                    node_ids=all_node_ids,
+                    node_weights=all_node_weights,
+                    netuid=64,
+                    version_key=VERSION_KEY,
+                    validator_node_id=int(uid),
+                    wait_for_inclusion=False,
+                    wait_for_finalization=False,
+                    max_attempts=3,
+                )
+            except Exception as e:
+                logger.error(f"Failed to set weights: {e}")
+                return False
+            if success:
+                logger.info("Weights set successfully.")
+                return True
+            else:
+                logger.error("Failed to set weights :(")
+                return False
+
     async def download_and_check_audit_reports(self):
         """
         Fetch and verify all audit reports.
@@ -882,9 +1086,10 @@ class Auditor:
         delete_directories = []
         async with get_session() as session:
             query = select(AuditEntry).where(
-                AuditEntry.created_at <= func.now() - timedelta(days=7, hours=1)
+                AuditEntry.created_at
+                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
             )
-            result = await session.execute(query)
+            result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
                 await session.delete(entry)
                 delete_directories.append("reports/{entry.entry_id}")
@@ -895,7 +1100,7 @@ class Auditor:
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
         for directory in delete_directories:
-            logger.info("Purging old data: {directory}")
+            logger.info(f"Purging old data: {directory}")
             shutil.rmtree(directory, ignore_errors=True)
 
         # Now load all new audit records.
@@ -908,9 +1113,15 @@ class Auditor:
                 hotkey=record["hotkey"],
                 block=record["block"],
                 path=record["path"],
-                created_at=datetime.fromisoformat(record["created_at"].rstrip("Z")),
-                start_time=datetime.fromisoformat(record["start_time"].rstrip("Z")),
-                end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")),
+                created_at=datetime.fromisoformat(record["created_at"].rstrip("Z")).replace(
+                    tzinfo=None
+                ),
+                start_time=datetime.fromisoformat(record["start_time"].rstrip("Z")).replace(
+                    tzinfo=None
+                ),
+                end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")).replace(
+                    tzinfo=None
+                ),
             )
             logger.info(
                 f"Need to verify new audit entry: {db_record.entry_id} "
@@ -964,6 +1175,7 @@ class Auditor:
             await conn.run_sync(Base.metadata.create_all)
 
         await self.download_and_check_audit_reports()
+        weights = await self.get_weights_to_set()
         return
 
         # try:

@@ -53,3 +53,12 @@ validators:
 
 # Subtensor node to query.
 subtensor: wss://entrypoint-finney.opentensor.ai
+
+# Weight setting.
+set_weights:
+  # Only available/functional if you are a registered validator on subnet 64 with sufficient stake.
+  enabled: false
+  # This is the ss58Address from the hotkey JSON
+  ss58_address: 5GerCEPSx22bmr5Wnm2wj87SSpZiVvhVqFUrGG5795XkUbjr
+  # This is the secretSeed value from hotkey JSON
+  secret_seed: 0x971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
