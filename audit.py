@@ -14,6 +14,7 @@ import asyncio
 import tempfile
 import hashlib
 import backoff
+import traceback
 from pathlib import Path
 import numpy as np
 import pybase64 as base64
@@ -26,7 +27,7 @@ from fiber.chain import fetch_nodes
 from fiber.networking.models import NodeWithFernet as Node
 from fiber.chain.chain_utils import query_substrate
 from functools import lru_cache
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from langdetect import detect as detect_language
 from term_image.image import from_file as image_from_file
 from loguru import logger
@@ -114,6 +115,13 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND i.completed_at IS NOT NULL
 GROUP BY i.miner_hotkey
 ORDER BY compute_units DESC;
+"""
+MISSING_INVOCATIONS_QUERY = """
+SELECT s.*
+  FROM synthetics s
+  LEFT JOIN invocations i ON s.invocation_id = i.invocation_id
+ WHERE (i.invocation_id IS NULL OR s.miner_hotkey != i.miner_hotkey)
+   AND created_at < (SELECT MAX(end_time) FROM audit_entries WHERE hotkey = '{hotkey}')
 """
 
 
@@ -932,6 +940,7 @@ class Auditor:
             try:
                 async with get_session() as session:
                     item["entry_id"] = record.entry_id
+                    item["hotkey"] = record.hotkey
                     session.add(MinerMetric(**item))
                     await session.commit()
                     total += 1
@@ -949,7 +958,8 @@ class Auditor:
             )
 
     async def get_weights_to_set(
-        self, hotkeys_to_node_ids: Optional[dict[str, int]] = None,
+        self,
+        hotkeys_to_node_ids: Optional[dict[str, int]] = None,
     ) -> tuple[list[int], list[float]] | None:
         """
         Get weights to set from the invocation data.
@@ -1037,6 +1047,7 @@ class Auditor:
             if len(node_ids) == 0:
                 logger.warning("No nodes to set weights for. Skipping weight setting.")
                 return False
+            self.compare_weights_to_actual(result)
 
             # Set weights!
             logger.info("Weights calculated, about to set...")
@@ -1073,9 +1084,9 @@ class Auditor:
                 logger.error("Failed to set weights :(")
                 return False
 
-    async def download_and_check_audit_reports(self):
+    async def download_and_check_audit_reports(self) -> int:
         """
-        Fetch and verify all audit reports.
+        Fetch and verify all audit reports, returning the number of new reports from validators.
         """
         async with self.aiosession() as session:
             async with session.get("https://api.chutes.ai/audit/") as resp:
@@ -1105,9 +1116,12 @@ class Auditor:
 
         # Now load all new audit records.
         total = 0
+        validator_total = 0
         by_id = {k: v for k, v in by_id.items() if k not in existing_ids}
         for _id, record in tqdm.tqdm(by_id.items()):
             total += 1
+            if record["hotkey"] in self.validators:
+                validator_total += 1
             db_record = AuditEntry(
                 entry_id=record["entry_id"],
                 hotkey=record["hotkey"],
@@ -1158,14 +1172,118 @@ class Auditor:
             logger.info("No new audit data to process.")
         else:
             logger.success(f"Successfully processed {total} new audit reports.")
+        return validator_total
 
-    async def perform_synthetics(self):
+    async def verify_synthetics(self):
         """
-        Continuously send small quantities of synthetic requests.
+        Continuously send small quantities of synthetic requests and ensure they appear in audit data.
         """
-        while self._running:
+        while self._running and self.config.synthetics.enabled:
+            # Check if any of the synthetics did not appear in the audit invocation data,
+            # or if the miner hotkey doesn't match, etc.
+            async with get_session() as session:
+                # XXX the assumption here is that the `validators` configured in the system is a list containing exactly one, the chutes vali.
+                results = (
+                    (
+                        await session.execute(
+                            text(MISSING_INVOCATIONS_QUERY.format(hotkey=list(self.validators)[0]))
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                for row in results:
+                    message = "SYNTHETIC IS MISSING!\n\t" + "\n\t".join(
+                        [f"{key}: {value}" for key, value in dict(row).items()]
+                    )
+                    logger.warning(message)
+
+            # Send another.
             await self.perform_synthetic()
             await asyncio.sleep(60)
+
+    def compare_weights_to_actual(self, weights_tuple):
+        """
+        Compare the weights we calculated to those in the metagraph.
+        """
+        uids, weights = weights_tuple
+        weight_map = dict(zip(uids, weights))
+        with self.substrate() as substrate:
+            nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
+        incentive_sum = sum([node.incentive for node in nodes])
+        for node in nodes:
+            expected = weight_map.get(node.node_id, 0.0)
+            actual = node.incentive / incentive_sum
+            if expected and actual:
+                delta = abs(expected - actual)
+                message = f"Calculated incentive locally for {node.hotkey} [{node.node_id:3d}]: {expected:.5f} vs actual {actual:.5f}, delta {delta:.5f}"
+                if delta <= 0.03:
+                    logger.success(message)
+                else:
+                    logger.warning(message)
+
+    async def _verify_integrity(self):
+        """
+        Continuously check for new audit data, verify the numbers line up, and set weights.
+        """
+        first_run = True
+        while self._running:
+            if not await self.download_and_check_audit_reports():
+                # No new data, let's see how long we should wait before trying again.
+                wait_time = 60
+                async with get_session() as session:
+                    most_recent = (
+                        await session.execute(
+                            select(AuditEntry).order_by(AuditEntry.start_time.desc()).limit(1)
+                        )
+                    ).scalar_one_or_none()
+                if most_recent:
+                    now = datetime.now(timezone.utc).replace(tzinfo=None)
+                    delta = int((now - most_recent.end_time).total_seconds())
+                    wait_time = (60 * 60 + 30) - delta
+                    if wait_time < 0:
+                        logger.warning(
+                            "It seems the audit data is lagging behind and/or is not being gnerated - this is a problem!"
+                        )
+                        wait_time = 60
+                    else:
+                        logger.info(
+                            f"The most recent report end time is from {delta} seconds ago, waiting {wait_time} seconds before retrying..."
+                        )
+                else:
+                    # This is basically impossible?
+                    logger.warning("Should not be here, why???")
+                if first_run and most_recent:
+                    logger.info(
+                        "No new audit data, but here is the most recent weight data output from the "
+                        f"report spanning {most_recent.start_time} through {most_recent.end_time}"
+                    )
+                    self.compare_weights_to_actual(await self.get_weights_to_set())
+
+                await asyncio.sleep(wait_time)
+            else:
+                if self.config.set_weights.enabled:
+                    await self.get_and_set_weights()
+                else:
+                    # If we aren't setting weights, we can at least examine them.
+                    self.compare_weights_to_actual(await self.get_weights_to_set())
+                await asyncio.sleep(10)
+            first_run = False
+
+    async def verify_integrity(self):
+        """
+        Wrapper around _verify_integrity with retries.
+        """
+        while True:
+            try:
+                await self._verify_integrity()
+            except Exception as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                logger.error(
+                    f"Unhandled exception performing integrity checks: {exc}\n{traceback.format_exc()}"
+                )
+                await asyncio.sleep(30)
 
     async def run(self):
         """
@@ -1174,21 +1292,13 @@ class Auditor:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        await self.download_and_check_audit_reports()
-        weights = await self.get_weights_to_set()
+        await self.verify_synthetics()
         return
-
-        # try:
-        #    await self.perform_synthetic()
-        #    return
-        # finally:
-        #    if self._asession:
-        #        await self._asession.close()
 
         tasks = []
         try:
-            # tasks.append(asyncio.create_task(self.perform_synthetics()))
-            # tasks.append(asyncio.create_task(self.check_integrity()))
+            tasks.append(asyncio.create_task(self.verify_integrity()))
+            tasks.append(asyncio.create_task(self.verify_synthetics()))
             while True:
                 await asyncio.sleep(60)
         except KeyboardInterrupt:
