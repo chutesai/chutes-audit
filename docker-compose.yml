@@ -14,8 +14,11 @@ services:
   auditor:
     build:
       context: .
+    working_dir: /audit
+    command: poetry run python audit.py
     volumes:
-      - ./:/audit
+      - ${PWD}/audit.py:/audit/audit.py
+      - ${PWD}/config:/audit/config
       - hfcache:/root/.cache
       - ./reports:/reports
     environment:

@@ -251,7 +251,9 @@ class Auditor:
         Load config.
         """
         if not config_path:
-            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+            config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "config", "config.yml"
+            )
         logger.debug(f"Loading {config_path=}")
         with open(config_path, "r") as infile:
             self.config = munchify(yaml.safe_load(infile))
