@@ -508,7 +508,7 @@ class Auditor:
                                 Synthetic(
                                     instance_id=target.instance_id,
                                     parent_invocation_id=parent_id,
-                                    invocation_id=target.invocation_id,
+                                    invocation_id=target.child_id,
                                     chute_id=chute.chute_id,
                                     miner_uid=target.uid,
                                     miner_hotkey=target.hotkey,
