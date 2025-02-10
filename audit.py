@@ -123,6 +123,25 @@ SELECT s.*
  WHERE (i.invocation_id IS NULL OR s.miner_hotkey != i.miner_hotkey)
    AND created_at < (SELECT MAX(end_time) FROM audit_entries WHERE hotkey = '{hotkey}')
 """
+MINER_SUMMARY_METRICS_QUERY = """
+SELECT
+   COALESCE(i.miner_hotkey, m.hotkey) as hotkey,
+   i.invocation_count,
+   m.metrics_count
+FROM
+   (SELECT miner_hotkey, COUNT(*) AS invocation_count
+    FROM invocations
+    WHERE error_message is null
+    GROUP BY miner_hotkey) i
+FULL OUTER JOIN
+   (SELECT hotkey, SUM(total_count) as metrics_count
+    FROM miner_metrics
+    GROUP BY hotkey) m
+ON i.miner_hotkey = m.hotkey
+ORDER BY COALESCE(i.invocation_count, 0) DESC
+"""
+MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
+EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 
 
 class IntegrityViolation(RuntimeError): ...
@@ -1174,7 +1193,7 @@ class Auditor:
             logger.success(f"Successfully processed {total} new audit reports.")
         return validator_total
 
-    async def verify_synthetics(self):
+    async def send_and_verify_synthetics(self):
         """
         Continuously send small quantities of synthetic requests and ensure they appear in audit data.
         """
@@ -1222,6 +1241,53 @@ class Auditor:
                 else:
                     logger.warning(message)
 
+    async def compare_miner_metrics(self):
+        """
+        Check the miner reported metric data against the validator reported data.
+        """
+        async with get_session() as session:
+            # Check how much coverage the miner has.
+            hotkeys = (
+                (await session.execute(text("SELECT DISTINCT(miner_hotkey) FROM invocations")))
+                .scalars()
+                .all()
+            )
+            logger.info("Checking audit data coverage for each miner with any invocations...")
+            for hotkey in hotkeys:
+                coverages = (
+                    (await session.execute(text(MINER_COVERAGE_QUERY.format(hotkey=hotkey))))
+                    .scalars()
+                    .all()
+                )
+                for coverage_seconds in coverages:
+                    if coverage_seconds != EXPECTED_COVERAGE:
+                        logger.warning(
+                            f"Miner {hotkey} is missing some audit report data: expecting {EXPECTED_COVERAGE} seconds but have {coverage_seconds}"
+                        )
+                    else:
+                        logger.success(
+                            f"Miner {hotkey} has full audit report coverage [{EXPECTED_COVERAGE} seconds]"
+                        )
+
+            # Compare prometheus metrics first.
+            logger.info(
+                "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
+            )
+            metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
+            for row in metrics:
+                hotkey, audit_count, reported_count = row
+                if not reported_count:
+                    logger.warning(f"Miner {hotkey} has no reported metrics...")
+                    continue
+                ratio = min([audit_count, reported_count]) / (
+                    max([audit_count, reported_count]) or 1.0
+                )
+                message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
+                if ratio < 0.9:
+                    logger.warning(message)
+                else:
+                    logger.success(message)
+
     async def _verify_integrity(self):
         """
         Continuously check for new audit data, verify the numbers line up, and set weights.
@@ -1259,6 +1325,7 @@ class Auditor:
                         f"report spanning {most_recent.start_time} through {most_recent.end_time}"
                     )
                     self.compare_weights_to_actual(await self.get_weights_to_set())
+                    await self.compare_miner_metrics()
 
                 await asyncio.sleep(wait_time)
             else:
@@ -1267,10 +1334,14 @@ class Auditor:
                 else:
                     # If we aren't setting weights, we can at least examine them.
                     self.compare_weights_to_actual(await self.get_weights_to_set())
+
+                # Compare the validator stats to miner self-reported stats.
+                await self.compare_miner_metrics()
+
                 await asyncio.sleep(10)
             first_run = False
 
-    async def verify_integrity(self):
+    async def verify_integrity_and_set_weights(self):
         """
         Wrapper around _verify_integrity with retries.
         """
@@ -1292,13 +1363,10 @@ class Auditor:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        await self.verify_synthetics()
-        return
-
         tasks = []
         try:
-            tasks.append(asyncio.create_task(self.verify_integrity()))
-            tasks.append(asyncio.create_task(self.verify_synthetics()))
+            tasks.append(asyncio.create_task(self.verify_integrity_and_set_weights()))
+            tasks.append(asyncio.create_task(self.send_and_verify_synthetics()))
             while True:
                 await asyncio.sleep(60)
         except KeyboardInterrupt:
