@@ -281,7 +281,7 @@ class Auditor:
         self.ss58_address = None
         self.keypair = None
         if self.config.set_weights.enabled:
-            self.ss58_address = self.config.set_weights.s58_address
+            self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
 
     @contextmanager
