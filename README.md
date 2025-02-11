@@ -40,7 +40,7 @@ If you wish, rather than child hotkey or running a full validator with all the (
 set_weights:
   enabled: false
   ss58_address: 5GerCEPSx22bmr5Wnm2wj87SSpZiVvhVqFUrGG5795XkUbjr
-  secret_seed: 0x971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
+  secret_seed: '0x971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20'
 ```
 ### Running the auditor
 Before attempting to run the auditor, be sure to go through the `config/config.yml` file and make any changes you wish. The biggest changes are:
