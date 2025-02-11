@@ -38,7 +38,7 @@ You can see here, the delta very small, < 0.2%.
 If you wish, rather than child hotkey or running a full validator with all the (expensive) bells and whistles, you can use this system to independently set weights from the audit export data. To do so, update `config/config.yml`, for example:
 ```yaml
 set_weights:
-  enabled: false
+  enabled: true
   ss58_address: 5GerCEPSx22bmr5Wnm2wj87SSpZiVvhVqFUrGG5795XkUbjr
   secret_seed: '0x971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20'
 ```
