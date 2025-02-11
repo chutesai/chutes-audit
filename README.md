@@ -46,7 +46,7 @@ set_weights:
 Before attempting to run the auditor, be sure to go through the `config/config.yml` file and make any changes you wish. The biggest changes are:
 1. Confgure api_key with a valid API key for chutes. You can register either via the CLI or through chutes.ai, then get an API key (again, either with `chutes keys create --name foo ...` or from the website).
 2. If you are a validator, registered on 64, and wish to set weights, be sure to configure the `set_weights` section with your SS58 and hotkey seed.
-
+*You will either need to add balance to your account, or notify the chutes team of your username to enable free access!*
 Once you have the configuration updated, there are two ways to run it:
 Option 1: install python, poetry, etc., and use it without docker
 You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
