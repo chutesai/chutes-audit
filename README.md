@@ -44,16 +44,20 @@ set_weights:
 ```
 ### Running the auditor
 Before attempting to run the auditor, be sure to go through the `config/config.yml` file and make any changes you wish. The biggest changes are:
+
 1. Confgure api_key with a valid API key for chutes. You can register either via the CLI or through chutes.ai, then get an API key (again, either with `chutes keys create --name foo ...` or from the website).
 2. If you are a validator, registered on 64, and wish to set weights, be sure to configure the `set_weights` section with your SS58 and hotkey seed.
-*You will either need to add balance to your account, or notify the chutes team of your username to enable free access!*
-Once you have the configuration updated, there are two ways to run it:
-Option 1: install python, poetry, etc., and use it without docker
+
+Note: You will either need to add balance to your account, notify the chutes team of your username to enable free access, or use the `chutes link ...` command if you are a validator/subnet owner to enable free access: https://github.com/rayonlabs/chutes?tab=readme-ov-file#-validators-and-subnet-owners
+
+Once you have the config file updated, there are two ways to run it:
+
+__Option 1:__ install python, poetry, etc., and use it without docker
 You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
 You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
 Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
 
-Option 2: just use docker compose
+__Option 2:__ just use docker compose
 ```bash
 docker compose up --build auditor
 ```
