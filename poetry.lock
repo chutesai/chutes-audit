@@ -1084,7 +1084,7 @@ full = ["cryptography (>=43.0.0,<43.1.0)", "fastapi (==0.112.0)", "httpx (==0.27
 [package.source]
 type = "git"
 url = "https://github.com/rayonlabs/fiber.git"
-reference = "HEAD"
+reference = "2.2.1"
 resolved_reference = "6f95e0b3c36174e8cf99a105883a832d0de080fc"
 
 [[package]]
@@ -3708,4 +3708,4 @@ propcache = ">=0.2.0"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "2aacef494fa72b749bb6eb8c211ef9aa13ac8a26fbb1af6ebd1872245ee52af6"
+content-hash = "d7319066ff4d699b0f4c7d448a4ef49db1b1471083bb8c891173e8bf7c8707d2"
