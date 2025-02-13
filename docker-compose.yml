@@ -20,7 +20,7 @@ services:
     volumes:
       - ${PWD}/audit.py:/audit/audit.py
       - ${PWD}/config:/audit/config
-      - hfcache_dtao:/root/.cache
+      - hfhub:/root/.cache/huggingface
       - ./reports:/reports
     environment:
       - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes_audit
@@ -30,4 +30,4 @@ services:
 
 volumes:
   postgres_data:
-  hfcache_dtao:
+  hfhub:
