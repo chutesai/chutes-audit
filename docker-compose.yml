@@ -14,12 +14,13 @@ services:
   auditor:
     build:
       context: .
+      no_cache: true
     working_dir: /audit
     command: poetry run python audit.py
     volumes:
       - ${PWD}/audit.py:/audit/audit.py
       - ${PWD}/config:/audit/config
-      - hfcache:/root/.cache
+      - hfcache_dtao:/root/.cache
       - ./reports:/reports
     environment:
       - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes_audit
@@ -29,4 +30,4 @@ services:
 
 volumes:
   postgres_data:
-  hfcache:
+  hfcache_dtao:
