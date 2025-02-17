@@ -121,7 +121,7 @@ SELECT s.*
   FROM synthetics s
   LEFT JOIN invocations i ON s.invocation_id = i.invocation_id
  WHERE (i.invocation_id IS NULL OR s.miner_hotkey != i.miner_hotkey)
-   AND created_at < (SELECT MAX(end_time) FROM audit_entries WHERE hotkey = '{hotkey}')
+   AND created_at < (SELECT MAX(start_time) FROM audit_entries WHERE hotkey = '{hotkey}')
 """
 MINER_SUMMARY_METRICS_QUERY = """
 SELECT
