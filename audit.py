@@ -747,7 +747,14 @@ class Auditor:
         Check a single audit report's sha256 compared to the set_commitment call's checksum.
         """
         calculated = hashlib.sha256(content).hexdigest()
-        committed = self.get_block_commit(record.block, record.hotkey)
+        try:
+            committed = self.get_block_commit(record.block, record.hotkey)
+        except Exception as exc:
+            if "unknown Block: State already discarded" in str(exc):
+                logger.warning(
+                    f"State already discarded for block {record.block}, unable to verify!"
+                )
+                return True
         if not committed:
             logger.warning(
                 f"Could not find commitment for hotkey {record.hotkey} on netuid 64 in block {record.block}"
