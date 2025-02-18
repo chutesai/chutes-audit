@@ -497,7 +497,7 @@ class Auditor:
                         logger.warning(
                             f"Error sending synthetic to {chute.chute_id} [{chute.name}]: {resp.status=} {await resp.text()}"
                         )
-                        return
+                        return []
                     parent_id = resp.headers["X-Chutes-InvocationID"]
                     async for chunk_bytes in resp.content:
                         if not chunk_bytes or not chunk_bytes.startswith(b"data: "):
@@ -531,7 +531,7 @@ class Auditor:
             return synthetics
         except Exception as exc:
             logger.warning(f"Error performing synthetic request: {exc}")
-        return None
+        return []
 
     @staticmethod
     def _debug_target(chunk) -> None:
