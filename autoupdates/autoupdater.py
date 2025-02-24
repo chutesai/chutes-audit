@@ -56,7 +56,7 @@ def update_local_repo(remote_commit: str):
     time.sleep(20)
 
     logging.info("Finished running the autoupdate steps! Ready to go 😎")
-
+ 
 
 def run_auto_updater():
     logging.info("Running the autoupdater! First I'll start 'er up...")
