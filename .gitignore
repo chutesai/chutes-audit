@@ -166,5 +166,5 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-
-Dockerfile
+# So we can get git reset --hard but still have a backup of the config.yml file, to restore after during autoupdates
+config/config.yml.backup
