@@ -53,7 +53,7 @@ def update_local_repo(remote_commit: str):
     restore_config()
 
     os.system("./utils/autoupdate_steps.sh")
-    time.sleep(20)
+    time.sleep(5)
 
     logging.info("Finished running the autoupdate steps! Ready to go 😎")
  
@@ -76,7 +76,7 @@ def run_auto_updater():
             logging.info(
                 "Local repo is not up-to-date with github, there's been an update! Updating now..."
             )
-            update_local_repo(remote_commit)
+            update_local_repo(remote_commit) 
 
         else:
             logging.info("Repo is up-to-date.")
