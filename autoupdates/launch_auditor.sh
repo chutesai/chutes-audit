@@ -1,1 +1,1 @@
-docker compose up --build auditor
+docker compose up --build auditor -d
