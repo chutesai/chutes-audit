@@ -52,7 +52,7 @@ def update_local_repo(remote_commit: str):
 
     restore_config()
 
-    os.system("./autoupdates/autoupdate_steps.sh")
+    os.system("./utils/autoupdate_steps.sh")
     time.sleep(20)
 
     logging.info("Finished running the autoupdate steps! Ready to go 😎")
@@ -61,7 +61,7 @@ def update_local_repo(remote_commit: str):
 def run_auto_updater():
     logging.info("Running the autoupdater! First I'll start 'er up...")
 
-    os.system("./autoupdates/launch_auditor.sh")
+    os.system("./utils/launch_auditor.sh")
     time.sleep(60)
     logging.info("Auditor container launched successfully!")
  

@@ -66,7 +66,7 @@ apt-get install -y -qq jq
 
 **Run the autoupdater**
 ```bash
-pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python autoupdates/autoupdater.py"
+pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python utils/autoupdater.py"
 ``` 
  
 
