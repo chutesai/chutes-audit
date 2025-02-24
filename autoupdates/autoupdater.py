@@ -52,7 +52,7 @@ def update_local_repo(remote_commit: str):
 
     restore_config()
 
-    os.system("./autoupdates/autoupdate_validator_steps.sh")
+    os.system("./autoupdates/autoupdate_steps.sh")
     time.sleep(20)
 
     logging.info("Finished running the autoupdate steps! Ready to go 😎")
