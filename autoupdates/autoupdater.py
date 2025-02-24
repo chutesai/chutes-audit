@@ -64,7 +64,7 @@ def run_auto_updater():
     os.system("./autoupdates/launch_auditor.sh")
     time.sleep(60)
     logging.info("Auditor container launched successfully!")
-
+ 
     while True:
         logging.info("Checking github for updates to the auditor code...")
         current_branch = subprocess.getoutput("git rev-parse --abbrev-ref HEAD")
