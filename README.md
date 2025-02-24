@@ -57,10 +57,10 @@ Once you have the config file updated, there are two ways to run it:
 
 __Option 1:__ Run the autoupdater
 ```bash
-pm2 start --name "autoupdates" "python autoupdates/autoupdater.py"
+pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python autoupdates/autoupdater.py"
 ```
  
-
+ 
 
 __Option 2:__ just use docker compose
 ```bash
