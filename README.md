@@ -53,13 +53,30 @@ Before attempting to run the auditor, be sure to go through the `config/config.y
 Note: You will either need to add balance to your account, notify the chutes team of your username to enable free access, or use the `chutes link ...` command if you are a validator/subnet owner to enable free access: https://github.com/rayonlabs/chutes?tab=readme-ov-file#-validators-and-subnet-owners
 
 Once you have the config file updated, there are two ways to run it:
+ 
 
-__Option 1:__ install python, poetry, etc., and use it without docker
-You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
-You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
-Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
+__Option 1:__ Run the autoupdater (Ensure you have python installed)
+
+**Install pm2 if needed**
+```bash
+apt-get install -y -qq nodejs npm
+npm i -g -q pm2
+apt-get install -y -qq jq
+```
+
+**Run the autoupdater**
+```bash
+pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python utils/autoupdater.py"
+``` 
+ 
 
 __Option 2:__ just use docker compose
 ```bash
 docker compose up --build auditor
 ```
+
+
+__Option 3:__ install python, poetry, etc., and use it without docker
+You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
+You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
+Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
