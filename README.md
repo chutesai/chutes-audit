@@ -55,7 +55,7 @@ Note: You will either need to add balance to your account, notify the chutes tea
 Once you have the config file updated, there are two ways to run it:
  
 
-__Option 1:__ Run the autoupdater
+__Option 1:__ Run the autoupdater (Ensure you have python installed)
 
 **Install pm2 if needed**
 ```bash
