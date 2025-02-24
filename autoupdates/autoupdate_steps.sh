@@ -1,3 +1,3 @@
 
 
-./launch_auditor.sh
+./autoupdates/launch_auditor.sh
