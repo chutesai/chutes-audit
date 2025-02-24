@@ -56,6 +56,15 @@ Once you have the config file updated, there are two ways to run it:
  
 
 __Option 1:__ Run the autoupdater
+
+**Install pm2 if needed**
+```bash
+apt-get install -y -qq nodejs npm
+npm i -g -q pm2
+apt-get install -y -qq jq
+```
+
+**Run the autoupdater**
 ```bash
 pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python autoupdates/autoupdater.py"
 ``` 
