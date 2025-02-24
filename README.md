@@ -54,12 +54,21 @@ Note: You will either need to add balance to your account, notify the chutes tea
 
 Once you have the config file updated, there are two ways to run it:
 
-__Option 1:__ install python, poetry, etc., and use it without docker
-You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
-You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
-Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
+
+__Option 1:__ Run the autoupdater
+```python
+python autoupdates/autoupdater.py
+```
+
+
 
 __Option 2:__ just use docker compose
 ```bash
 docker compose up --build auditor
 ```
+
+
+__Option 3:__ install python, poetry, etc., and use it without docker
+You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
+You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
+Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
