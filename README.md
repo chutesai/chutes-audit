@@ -59,7 +59,7 @@ __Option 1:__ Run the autoupdater
 ```python
 python autoupdates/autoupdater.py
 ```
-
+ 
 
 
 __Option 2:__ just use docker compose
