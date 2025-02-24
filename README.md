@@ -53,11 +53,11 @@ Before attempting to run the auditor, be sure to go through the `config/config.y
 Note: You will either need to add balance to your account, notify the chutes team of your username to enable free access, or use the `chutes link ...` command if you are a validator/subnet owner to enable free access: https://github.com/rayonlabs/chutes?tab=readme-ov-file#-validators-and-subnet-owners
 
 Once you have the config file updated, there are two ways to run it:
-
+ 
 
 __Option 1:__ Run the autoupdater
-```python
-python autoupdates/autoupdater.py
+```bash
+pm2 start --name "autoupdates" "python autoupdates/autoupdater.py"
 ```
  
 
