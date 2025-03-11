@@ -91,7 +91,6 @@ WITH computation_rates AS (
 SELECT
     i.miner_hotkey,
     COUNT(*) as invocation_count,
-    COUNT(DISTINCT(i.chute_id)) AS unique_chute_count,
     COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
@@ -115,6 +114,46 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND i.completed_at IS NOT NULL
 GROUP BY i.miner_hotkey
 ORDER BY compute_units DESC;
+"""
+UNIQUE_CHUTE_AVERAGE_QUERY = """
+WITH time_series AS (
+  SELECT
+    generate_series(
+      date_trunc('hour', now() - INTERVAL '7 days'),
+      date_trunc('hour', now()),
+      INTERVAL '10 minutes'
+    ) AS time_point
+),
+chute_timeframes AS (
+  SELECT
+    chute_id,
+    miner_hotkey,
+    MIN(started_at) AS first_invocation,
+    MAX(started_at) AS last_invocation
+  FROM invocations
+  WHERE
+    started_at >= now() - INTERVAL '7 days'
+    AND error_message IS NULL
+    AND completed_at IS NOT NULL
+  GROUP BY chute_id, miner_hotkey
+),
+ten_minute_active_chutes AS (
+  SELECT
+    t.time_point,
+    ct.miner_hotkey,
+    COUNT(DISTINCT ct.chute_id) AS active_chutes
+  FROM time_series t
+  LEFT JOIN chute_timeframes ct ON
+    t.time_point >= ct.first_invocation AND
+    t.time_point <= ct.last_invocation
+  GROUP BY t.time_point, ct.miner_hotkey
+)
+SELECT
+  miner_hotkey,
+  AVG(active_chutes)::integer AS avg_active_chutes
+FROM ten_minute_active_chutes
+GROUP BY miner_hotkey
+ORDER BY avg_active_chutes DESC;
 """
 MISSING_INVOCATIONS_QUERY = """
 SELECT s.*
@@ -1000,26 +1039,33 @@ class Auditor:
 
         query = text(MINER_METRICS_QUERY)
         raw_compute_values = {}
-        header = [
-            "hotkey",
-            "invocation_count",
-            "unique_chute_count",
-            "bounty_count",
-            "compute_units",
-        ]
         async with get_session() as session:
-            result = await session.execute(query)
-            for row in result:
-                obj = dict(zip(header, row))
-                raw_compute_values[obj["hotkey"]] = obj
-                logger.info(obj)
+            compute_result = await session.execute(query)
+            for hotkey, invocation_count, bounty_count, compute_units in compute_result:
+                raw_compute_values[hotkey] = {
+                    "invocation_count": invocation_count,
+                    "bounty_count": bounty_count,
+                    "compute_units": compute_units,
+                    "unique_chute_count": 0,
+                }
+            unique_query = text(UNIQUE_CHUTE_AVERAGE_QUERY)
+            unique_result = await session.execute(unique_query)
+            for miner_hotkey, average_active_chutes in unique_result:
+                if miner_hotkey not in raw_compute_values:
+                    raw_compute_values[miner_hotkey] = {
+                        "invocation_count": 0,
+                        "bounty_count": 0,
+                        "compute_units": 0,
+                        "unique_chute_count": 0,
+                    }
+                raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
-            key: sum(row[key] for row in raw_compute_values.values()) or 1.0 for key in header[1:]
+            key: sum(row[key] for row in raw_compute_values.values()) or 1.0 for key in FEATURE_WEIGHTS
         }
         normalized_values = {
-            hotkey: {key: row[key] / totals[key] for key in header[1:]}
+            hotkey: {key: row[key] / totals[key] for key in FEATURE_WEIGHTS}
             for hotkey, row in raw_compute_values.items()
         }
 
