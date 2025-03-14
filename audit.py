@@ -135,10 +135,16 @@ WITH time_series AS (
 instances_with_success AS (
   SELECT DISTINCT
     instance_id
-  FROM invocations
+  FROM invocations ii
   WHERE
-    error_message IS NULL AND
-    completed_at IS NOT NULL
+    error_message IS NULL
+    AND completed_at IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM reports
+        WHERE invocation_id = ii.parent_invocation_id
+        AND confirmed_at IS NOT NULL
+    )
 ),
 -- For each time point, find active instances that have had successful invocations
 active_instances_per_timepoint AS (
@@ -1133,6 +1139,8 @@ class Auditor:
         async with get_session() as session:
             compute_result = await session.execute(query)
             for hotkey, invocation_count, bounty_count, compute_units in compute_result:
+                if hotkey is None:
+                    continue
                 raw_compute_values[hotkey] = {
                     "invocation_count": invocation_count,
                     "bounty_count": bounty_count,
@@ -1142,6 +1150,8 @@ class Auditor:
             unique_query = text(UNIQUE_CHUTE_AVERAGE_QUERY)
             unique_result = await session.execute(unique_query)
             for miner_hotkey, average_active_chutes in unique_result:
+                if miner_hotkey is None:
+                    continue
                 if miner_hotkey not in raw_compute_values:
                     raw_compute_values[miner_hotkey] = {
                         "invocation_count": 0,
