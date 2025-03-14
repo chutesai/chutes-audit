@@ -1303,8 +1303,6 @@ class Auditor:
                     tzinfo=None
                 ),
             )
-            if db_record.hotkey not in self.validators:
-                continue
             logger.info(
                 f"Need to verify new audit entry: {db_record.entry_id} "
                 f"for data between {db_record.start_time} and {db_record.end_time}"
