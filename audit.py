@@ -50,6 +50,7 @@ from sqlalchemy import (
     select,
     ForeignKey,
     text,
+    Index,
 )
 from munch import munchify
 from datasets import load_dataset
@@ -112,6 +113,12 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
     AND i.miner_uid > 0
     AND i.completed_at IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM reports
+        WHERE invocation_id = i.parent_invocation_id
+        AND confirmed_at IS NOT NULL
+    )
 GROUP BY i.miner_hotkey
 ORDER BY compute_units DESC;
 """
@@ -121,37 +128,46 @@ WITH time_series AS (
     generate_series(
       date_trunc('hour', now() - INTERVAL '7 days'),
       date_trunc('hour', now()),
-      INTERVAL '10 minutes'
+      INTERVAL '1 hour'
     ) AS time_point
 ),
-chute_timeframes AS (
-  SELECT
-    chute_id,
-    miner_hotkey,
-    MIN(started_at) AS first_invocation,
-    MAX(started_at) AS last_invocation
+-- Get all instances that had at least one successful invocation (ever) while the instance was alive.
+instances_with_success AS (
+  SELECT DISTINCT
+    instance_id
   FROM invocations
   WHERE
-    started_at >= now() - INTERVAL '7 days'
-    AND error_message IS NULL
-    AND completed_at IS NOT NULL
-  GROUP BY chute_id, miner_hotkey
+    error_message IS NULL AND
+    completed_at IS NOT NULL
 ),
-ten_minute_active_chutes AS (
+-- For each time point, find active instances that have had successful invocations
+active_instances_per_timepoint AS (
   SELECT
-    t.time_point,
-    ct.miner_hotkey,
-    COUNT(DISTINCT ct.chute_id) AS active_chutes
-  FROM time_series t
-  LEFT JOIN chute_timeframes ct ON
-    t.time_point >= ct.first_invocation AND
-    t.time_point <= ct.last_invocation
-  GROUP BY t.time_point, ct.miner_hotkey
+    ts.time_point,
+    ia.instance_id,
+    ia.chute_id,
+    ia.miner_hotkey
+  FROM time_series ts
+  JOIN instance_audits ia ON
+    ia.verified_at <= ts.time_point AND
+    (ia.deleted_at IS NULL OR ia.deleted_at >= ts.time_point)
+  JOIN instances_with_success iws ON
+    ia.instance_id = iws.instance_id
+),
+-- Count distinct chute_ids per miner per time point
+active_chutes_per_timepoint AS (
+  SELECT
+    time_point,
+    miner_hotkey,
+    COUNT(DISTINCT chute_id) AS active_chutes
+  FROM active_instances_per_timepoint
+  GROUP BY time_point, miner_hotkey
 )
+-- Calculate average active chutes per miner across all time points
 SELECT
   miner_hotkey,
   AVG(active_chutes)::integer AS avg_active_chutes
-FROM ten_minute_active_chutes
+FROM active_chutes_per_timepoint
 GROUP BY miner_hotkey
 ORDER BY avg_active_chutes DESC;
 """
@@ -218,6 +234,22 @@ class Invocation(Base):
     metrics = Column(JSONB, nullable=True)
     started_at = Column(DateTime(timezone=False))
     completed_at = Column(DateTime(timezone=False), nullable=True)
+
+
+class Report(Base):
+    __tablename__ = "reports"
+    invocation_id = Column(String, nullable=False, primary_key=True)
+    user_id = Column(String, nullable=False)
+    timestamp = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    confirmed_at = Column(DateTime(timezone=True))
+    confirmed_by = Column(String)
+    reason = Column(String, nullable=False)
+
+    __table_args__ = (Index("idx_report_inv_cnfrm", "invocation_id", "confirmed_at"),)
 
 
 class InstanceAudit(Base):
@@ -786,6 +818,7 @@ class Auditor:
         Check a single audit report's sha256 compared to the set_commitment call's checksum.
         """
         calculated = hashlib.sha256(content).hexdigest()
+        committed = None
         try:
             committed = self.get_block_commit(record.block, record.hotkey)
         except Exception as exc:
@@ -824,11 +857,39 @@ class Auditor:
         interval=10,
         max_tries=7,
     )
-    async def download_and_check_one(self, db_record) -> str:
+    async def _download_csv(self, session, vali_url, remote_path, path, expected_digest, db_record):
+        # Download any reports.
+        logger.info(f"Downloading and verifying {remote_path}")
+        csv_path = Path(os.path.join("reports", db_record.entry_id, path)).resolve()
+        try:
+            csv_path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+        except ValueError:
+            raise ValueError(f"Path {csv_path} attempts to escape base directory!")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
+            csv_content = await csv_resp.read()
+            calculated = hashlib.sha256(csv_content).hexdigest()
+            if calculated != expected_digest:
+                raise IntegrityViolation(
+                    f"CSV export {remote_path} of validator: {vali_url} does not match!"
+                )
+            with open(csv_path, "wb") as outfile:
+                outfile.write(csv_content)
+            logger.success(f"Successfully downloaded CSV report data from {remote_path}")
+        return csv_path
+
+    @backoff.on_exception(
+        backoff.constant,
+        Exception,
+        jitter=None,
+        interval=10,
+        max_tries=7,
+    )
+    async def download_and_check_one(self, db_record):
         """
         Download and verify a single audit report (and the associated CSV exports if from validator).
         """
-        # Download the report locally.
+        # Download all exports from the validator.
         path = Path(os.path.join("reports", db_record.entry_id, db_record.path)).resolve()
         try:
             path.relative_to(os.path.dirname(os.path.abspath(__file__)))
@@ -836,7 +897,8 @@ class Auditor:
             raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
         path.parent.mkdir(parents=True, exist_ok=True)
         audit_content = None
-        csv_path = None
+        inv_csv_path = None
+        reports_csv_path = None
         data = None
         async with self.aiosession() as session:
             async with session.get(
@@ -847,37 +909,24 @@ class Auditor:
                     outfile.write(audit_content)
                     data = json.loads(audit_content)
 
-                # Also need to download the CSV reports if it's from a validator.
                 if db_record.hotkey in self.validators:
                     vali_url = self.validators[db_record.hotkey]["url"]
+
+                    # Invocations CSV exports.
                     inv = data.get("csv_exports", {}).get("invocations")
                     if inv:
-                        logger.info(
-                            f"Downloading and verifying CSV export of invocations: {inv['path']}"
-                        )
                         remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
-                        csv_path = Path(
-                            os.path.join("reports", db_record.entry_id, inv["path"])
-                        ).resolve()
-                        try:
-                            path.relative_to(os.path.dirname(os.path.abspath(__file__)))
-                        except ValueError:
-                            raise ValueError(
-                                f"Path {db_record.path} attempts to escape base directory!"
-                            )
-                        csv_path.parent.mkdir(parents=True, exist_ok=True)
-                        async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
-                            csv_content = await csv_resp.read()
-                            calculated = hashlib.sha256(csv_content).hexdigest()
-                            if calculated != inv["sha256"]:
-                                raise IntegrityViolation(
-                                    f"CSV export {remote_path} of validator: {vali_url} does not match!"
-                                )
-                            with open(csv_path, "wb") as outfile:
-                                outfile.write(csv_content)
-                            logger.success(
-                                f"Successfully downloaded CSV report data from {remote_path}"
-                            )
+                        inv_csv_path = await self._download_csv(
+                            session, vali_url, remote_path, inv["path"], inv["sha256"], db_record
+                        )
+
+                    # Reports CSV exports.
+                    reports = data.get("csv_exports", {}).get("reports")
+                    if reports:
+                        remote_path = reports["path"].replace("invocations/", "/invocations/exports/")
+                        reports_csv_path = await self._download_csv(
+                            session, vali_url, remote_path, reports["path"], reports["sha256"], db_record
+                        )
 
         # Now we can compare the sha256 of the report to the commitment on chain.
         logger.success(
@@ -888,7 +937,7 @@ class Auditor:
             raise IntegrityViolation(
                 f"Commitment on chain does not match downloaded report! {db_record.record_id}"
             )
-        return data, csv_path
+        return data, inv_csv_path, reports_csv_path
 
     async def load_invocations(self, session, csv_path):
         """
@@ -939,6 +988,48 @@ class Auditor:
                     batch = []
             if batch:
                 bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
+                await session.execute(bulk_insert)
+            await session.commit()
+        if total:
+            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+
+    async def load_reports(self, session, csv_path):
+        """
+        Populate our local database with invocaton reports from CSV.
+        """
+        logger.info(f"Inserting invocation report records from {csv_path}")
+        total = 0
+        with open(csv_path, "r") as infile:
+            reader = csv.DictReader(infile)
+            batch = []
+            for row in reader:
+                row_data = dict(row)
+                row_data.update(
+                    {
+                        "timestamp": datetime.fromisoformat(row["timestamp"].rstrip("Z")).replace(
+                            tzinfo=None
+                        ),
+                    }
+                )
+                if row["confirmed_at"]:
+                    row_data.update(
+                        {
+                            "confirmed_at": datetime.fromisoformat(
+                                row["confirmed_at"].rstrip("Z")
+                            ).replace(tzinfo=None)
+                        }
+                    )
+                for key in row_data:
+                    if isinstance(row_data[key], str) and not row_data[key].strip():
+                        row_data[key] = None
+                batch.append(row_data)
+                total += 1
+                if len(batch) == 100:
+                    bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
+                    await session.execute(bulk_insert)
+                    batch = []
+            if batch:
+                bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
                 await session.execute(bulk_insert)
             await session.commit()
         if total:
@@ -1062,7 +1153,8 @@ class Auditor:
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
-            key: sum(row[key] for row in raw_compute_values.values()) or 1.0 for key in FEATURE_WEIGHTS
+            key: sum(row[key] for row in raw_compute_values.values()) or 1.0
+            for key in FEATURE_WEIGHTS
         }
         normalized_values = {
             hotkey: {key: row[key] / totals[key] for key in FEATURE_WEIGHTS}
@@ -1217,7 +1309,9 @@ class Auditor:
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            audit_data, csv_path = await self.download_and_check_one(db_record)
+            audit_data, inv_csv_path, reports_csv_path = await self.download_and_check_one(
+                db_record
+            )
 
             # Persist the record to DB.
             async with get_session() as session:
@@ -1227,8 +1321,12 @@ class Auditor:
                     f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}"
                 )
                 # Load CSV invocation data if it's from a validator.
-                if csv_path:
-                    await self.load_invocations(session, csv_path)
+                if inv_csv_path:
+                    await self.load_invocations(session, inv_csv_path)
+
+                # Load reports CSV.
+                if reports_csv_path:
+                    await self.load_reports(session, reports_csv_path)
 
                 # Persist the actual audit entry data.
                 await self.load_audit_entries(db_record, audit_data)
@@ -1377,7 +1475,6 @@ class Auditor:
 
                 # Compare the validator stats to miner self-reported stats.
                 await self.compare_miner_metrics()
-
             await asyncio.sleep(60)
             first_run = False
 
