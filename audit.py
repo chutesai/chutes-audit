@@ -111,7 +111,7 @@ FROM invocations i
 LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
-    AND i.miner_uid > 0
+    AND i.miner_uid >= 0
     AND i.completed_at IS NOT NULL
     AND NOT EXISTS (
         SELECT 1
@@ -139,6 +139,7 @@ instances_with_success AS (
   WHERE
     error_message IS NULL
     AND completed_at IS NOT NULL
+    AND miner_uid >= 0
     AND NOT EXISTS (
         SELECT 1
         FROM reports
