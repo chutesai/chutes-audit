@@ -207,6 +207,9 @@ FROM
    (SELECT miner_hotkey, COUNT(*) AS invocation_count
     FROM invocations
     WHERE error_message is null
+    AND miner_hotkey is not null
+    AND completed_at is not null
+    AND miner_uid >= 0
     GROUP BY miner_hotkey) i
 FULL OUTER JOIN
    (SELECT hotkey, SUM(total_count) as metrics_count
@@ -943,9 +946,16 @@ class Auditor:
                     # Reports CSV exports.
                     reports = data.get("csv_exports", {}).get("reports")
                     if reports:
-                        remote_path = reports["path"].replace("invocations/", "/invocations/exports/")
+                        remote_path = reports["path"].replace(
+                            "invocations/", "/invocations/exports/"
+                        )
                         reports_csv_path = await self._download_csv(
-                            session, vali_url, remote_path, reports["path"], reports["sha256"], db_record
+                            session,
+                            vali_url,
+                            remote_path,
+                            reports["path"],
+                            reports["sha256"],
+                            db_record,
                         )
 
         # Now we can compare the sha256 of the report to the commitment on chain.
