@@ -155,9 +155,22 @@ active_instances_per_timepoint AS (
     ia.chute_id,
     ia.miner_hotkey
   FROM time_series ts
-  JOIN instance_audits ia ON
-    ia.verified_at <= ts.time_point AND
-    (ia.deleted_at IS NULL OR ia.deleted_at >= ts.time_point)
+  JOIN (
+    SELECT
+      instance_id,
+      chute_id,
+      miner_hotkey,
+      MIN(verified_at) AS first_verified_at,
+      CASE
+        WHEN COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) > 0 THEN
+          MIN(deleted_at)
+        ELSE NULL
+      END AS earliest_deleted_at
+    FROM instance_audits
+    GROUP BY instance_id, chute_id, miner_hotkey
+  ) ia ON
+    ia.first_verified_at <= ts.time_point AND
+    (ia.earliest_deleted_at IS NULL OR ia.earliest_deleted_at >= ts.time_point)
   JOIN instances_with_success iws ON
     ia.instance_id = iws.instance_id
 ),
