@@ -1463,7 +1463,7 @@ class Auditor:
             metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
             for row in metrics:
                 hotkey, audit_count, reported_count = row
-                if not reported_count:
+                if not audit_count or not reported_count:
                     logger.warning(f"Miner {hotkey} has no reported metrics...")
                     continue
                 ratio = min([audit_count, reported_count]) / (
