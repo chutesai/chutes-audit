@@ -110,7 +110,7 @@ SELECT
     ) AS compute_units
 FROM invocations i
 LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
-JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND i.miner_uid = mn.node_id AND mn.netuid = 64
+JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
     AND i.miner_uid >= 0
@@ -155,7 +155,6 @@ all_miners AS (
   FROM instance_audits ia
   -- Join with metagraph_nodes to filter for valid, registered miners
   JOIN metagraph_nodes mn ON ia.miner_hotkey = mn.hotkey
-                         AND ia.miner_uid = mn.node_id
   WHERE mn.netuid = 64
     AND mn.node_id >= 0
 ),
@@ -189,7 +188,6 @@ active_instances_per_timepoint AS (
     FROM instance_audits ia_inner
     -- Join with metagraph_nodes to filter for valid, registered miners
     JOIN metagraph_nodes mn ON ia_inner.miner_hotkey = mn.hotkey
-                           AND ia_inner.miner_uid = mn.node_id
     WHERE mn.netuid = 64
       AND mn.node_id >= 0
     GROUP BY ia_inner.instance_id, ia_inner.chute_id, ia_inner.miner_hotkey
