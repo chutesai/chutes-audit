@@ -44,6 +44,7 @@ from sqlalchemy import (
     DateTime,
     Double,
     Integer,
+    Float,
     Boolean,
     BigInteger,
     func,
@@ -109,6 +110,7 @@ SELECT
     ) AS compute_units
 FROM invocations i
 LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
+JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND i.miner_uid = mn.node_id AND mn.netuid = 64
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
     AND i.miner_uid >= 0
@@ -147,12 +149,25 @@ instances_with_success AS (
         AND confirmed_at IS NOT NULL
     )
 ),
--- Get all unique miner_hotkeys
+-- Get all unique miner_hotkeys for valid miners in the specified subnet from metagraph_nodes
 all_miners AS (
-  SELECT DISTINCT miner_hotkey
-  FROM instance_audits
+  SELECT DISTINCT ia.miner_hotkey
+  FROM instance_audits ia
+  -- Join with metagraph_nodes to filter for valid, registered miners
+  JOIN metagraph_nodes mn ON ia.miner_hotkey = mn.hotkey
+                         AND ia.miner_uid = mn.node_id
+  WHERE mn.netuid = 64
+    AND mn.node_id >= 0
 ),
--- For each time point, find active instances that have had successful invocations
+-- Get the maximum GPU count ever recorded for each chute_id
+max_gpu_counts AS (
+  SELECT
+    chute_id,
+    MAX(gpu_count) AS gpu_count
+  FROM gpu_counts
+  GROUP BY chute_id
+),
+-- For each time point, find active instances (belonging to valid miners) that have had successful invocations
 active_instances_per_timepoint AS (
   SELECT
     ts.time_point,
@@ -162,33 +177,48 @@ active_instances_per_timepoint AS (
   FROM time_series ts
   JOIN (
     SELECT
-      instance_id,
-      chute_id,
-      miner_hotkey,
-      MIN(verified_at) AS first_verified_at,
+      ia_inner.instance_id,
+      ia_inner.chute_id,
+      ia_inner.miner_hotkey,
+      MIN(ia_inner.verified_at) AS first_verified_at,
       CASE
-        WHEN COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) > 0 THEN
-          MIN(deleted_at)
+        WHEN COUNT(CASE WHEN ia_inner.deleted_at IS NOT NULL THEN 1 END) > 0 THEN
+          MIN(ia_inner.deleted_at)
         ELSE NULL
       END AS earliest_deleted_at
-    FROM instance_audits
-    GROUP BY instance_id, chute_id, miner_hotkey
+    FROM instance_audits ia_inner
+    -- Join with metagraph_nodes to filter for valid, registered miners
+    JOIN metagraph_nodes mn ON ia_inner.miner_hotkey = mn.hotkey
+                           AND ia_inner.miner_uid = mn.node_id
+    WHERE mn.netuid = 64
+      AND mn.node_id >= 0
+    GROUP BY ia_inner.instance_id, ia_inner.chute_id, ia_inner.miner_hotkey
   ) ia ON
     ia.first_verified_at <= ts.time_point AND
     (ia.earliest_deleted_at IS NULL OR ia.earliest_deleted_at >= ts.time_point)
+  -- Ensure the instance had at least one successful invocation
   JOIN instances_with_success iws ON
     ia.instance_id = iws.instance_id
 ),
--- Count distinct chute_ids per miner per time point
+-- Calculate GPU-weighted chute count per miner per time point
 active_chutes_per_timepoint AS (
   SELECT
-    time_point,
-    miner_hotkey,
-    COUNT(DISTINCT chute_id) AS active_chutes
-  FROM active_instances_per_timepoint
-  GROUP BY time_point, miner_hotkey
+    aipt.time_point,
+    aipt.miner_hotkey,
+    SUM(COALESCE(mgc.gpu_count, 1)) AS gpu_weighted_chutes
+  FROM (
+    SELECT DISTINCT
+      time_point,
+      miner_hotkey,
+      chute_id
+    FROM active_instances_per_timepoint
+  ) aipt
+  -- Left join with the maximum GPU counts for each chute
+  LEFT JOIN max_gpu_counts mgc ON
+    aipt.chute_id = mgc.chute_id
+  GROUP BY aipt.time_point, aipt.miner_hotkey
 ),
--- Create a cross join of all time points with all miners
+-- Create a cross join of all time points with all *valid* miners
 all_timepoints_for_all_miners AS (
   SELECT
     ts.time_point,
@@ -201,19 +231,19 @@ complete_dataset AS (
   SELECT
     atm.miner_hotkey,
     atm.time_point,
-    COALESCE(acpt.active_chutes, 0) AS active_chutes
+    COALESCE(acpt.gpu_weighted_chutes, 0) AS gpu_weighted_chutes
   FROM all_timepoints_for_all_miners atm
   LEFT JOIN active_chutes_per_timepoint acpt ON
     atm.time_point = acpt.time_point AND
     atm.miner_hotkey = acpt.miner_hotkey
 )
--- Calculate average active chutes per miner across all time points
+-- Calculate average GPU-weighted chutes per miner across all time points
 SELECT
   miner_hotkey,
-  AVG(active_chutes)::integer AS avg_active_chutes
+  AVG(gpu_weighted_chutes)::integer AS avg_gpu_weighted_chutes
 FROM complete_dataset
 GROUP BY miner_hotkey
-ORDER BY avg_active_chutes DESC;
+ORDER BY avg_gpu_weighted_chutes DESC;
 """
 MISSING_INVOCATIONS_QUERY = """
 SELECT s.*
@@ -363,6 +393,35 @@ class Target(BaseModel):
     error: str = None
 
 
+class MetagraphNode(Base):
+    __tablename__ = "metagraph_nodes"
+    hotkey = Column(String, primary_key=True)
+    checksum = Column(String, nullable=False)
+    coldkey = Column(String, nullable=False)
+    node_id = Column(Integer)
+    incentive = Column(Float)
+    netuid = Column(Integer)
+    stake = Column(Float)
+    tao_stake = Column(Float)
+    alpha_stake = Column(Float)
+    trust = Column(Float)
+    vtrust = Column(Float)
+    last_updated = Column(Integer)
+    ip = Column(String)
+    ip_type = Column(Integer)
+    port = Column(Integer)
+    protocol = Column(Integer)
+    real_host = Column(String)
+    real_port = Column(Integer)
+    synced_at = Column(DateTime, server_default=func.now())
+
+
+class GPUCount(Base):
+    __tablename__ = "gpu_counts"
+    chute_id = Column(String, primary_key=True)
+    gpu_count = Column(Integer)
+
+
 class Auditor:
     def __init__(self, config_path: str = None):
         """
@@ -427,6 +486,52 @@ class Auditor:
                     trust_env=True,
                 )
             yield self._asession
+
+    async def sync_and_save_metagraph(self):
+        """
+        Sync metagraph to DB.
+        """
+        with self.substrate() as substrate:
+            nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
+        if not nodes:
+            raise Exception("Failed to load metagraph nodes!")
+        async with get_session() as session:
+            hotkeys = ", ".join([f"'{node.hotkey}'" for node in nodes])
+            result = await session.execute(
+                text(
+                    f"DELETE FROM metagraph_nodes WHERE netuid = 64 AND hotkey NOT IN ({hotkeys}) AND node_id >= 0"
+                )
+            )
+            for node in nodes:
+                node_dict = node.dict()
+                node_dict.pop("last_updated", None)
+                node_dict["checksum"] = hashlib.sha256(json.dumps(node_dict)).hexdigest()
+                statement = pg_insert(MetagraphNode).values(node_dict)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["hotkey"],
+                    set_={key: getattr(statement.excluded, key) for key, value in node_dict.items()},
+                    where=MetagraphNode.checksum != node_dict["checksum"],
+                )
+                await session.execute(statement)
+            logger.info(f"Successfully synced metagraph nodes for netuid 64.")
+            await session.commit()
+
+    async def sync_gpu_counts(self):
+        """
+        Sync GPU count info.
+        """
+        async with self.aiosession() as session:
+            async with session.get("https://api.chutes.ai/chutes/gpu_count_history") as resp:
+                gpu_counts = await resp.json()
+
+        async with get_session() as session:
+            await session.execute(text("DELETE FROM gpu_counts"))
+            for info in gpu_counts:
+                await session.execute(
+                    text("INSERT INTO gpu_counts (chute_id, gpu_count) VALUES (:chute_id, :gpu_count) ON CONFLICT (chute_id) DO NOTHING"),
+                    {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]}
+                )
+            await session.commit()
 
     def get_random_image_payload(self, model: str):
         """
@@ -1505,6 +1610,14 @@ class Auditor:
         """
         first_run = True
         while self._running:
+            try:
+                await self.sync_and_save_metagraph()
+                await self.sync_gpu_counts()
+            except Exception as exc:
+                logger.error(f"Unhandled exception updating metagraph/gpu counts: {exc}")
+                await asyncio.sleep(30)
+                continue
+
             if not await self.download_and_check_audit_reports():
                 # No new data, let's see how long we should wait before trying again.
                 async with get_session() as session:
