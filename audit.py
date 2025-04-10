@@ -272,6 +272,58 @@ ORDER BY COALESCE(i.invocation_count, 0) DESC
 """
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
+# Minimum required utilization scoring cutoff (dust removal).
+UTILIZATION_THRESHOLD = 0.02
+UTILIZATION_RATIO_QUERY = """
+WITH instance_spans AS (
+  SELECT
+    miner_hotkey, instance_id,
+    MAX(completed_at) - MIN(started_at) as total_active_time,
+    SUM(completed_at - started_at) AS total_processing_time
+  FROM invocations
+  WHERE started_at >= now() - INTERVAL '7 days'
+  AND error_message IS NULL AND completed_at IS NOT NULL
+  GROUP BY miner_hotkey, instance_id
+),
+instance_metrics AS (
+  SELECT
+    miner_hotkey, instance_id,
+    EXTRACT(EPOCH FROM total_active_time) AS total_active_seconds,
+    EXTRACT(EPOCH FROM total_processing_time) AS total_processing_seconds,
+    CASE
+      WHEN EXTRACT(EPOCH FROM total_active_time) > 0
+      THEN ROUND(
+        (EXTRACT(EPOCH FROM total_processing_time) /
+         EXTRACT(EPOCH FROM total_active_time))::numeric,
+        2
+      )
+      ELSE 0
+    END AS busy_ratio
+  FROM instance_spans
+  JOIN metagraph_nodes mn ON instance_spans.miner_hotkey = mn.hotkey
+),
+ranked_instances AS (
+  SELECT
+    miner_hotkey, instance_id,
+    total_active_seconds, total_processing_seconds, busy_ratio,
+    ROW_NUMBER() OVER (PARTITION BY miner_hotkey ORDER BY busy_ratio DESC) AS rank
+  FROM instance_metrics WHERE total_active_seconds >= 3600
+),
+top_instances AS (
+  SELECT
+    miner_hotkey, instance_id,
+    total_active_seconds, total_processing_seconds, busy_ratio
+  FROM ranked_instances
+  WHERE rank <= 3
+)
+SELECT
+  miner_hotkey,
+  ROUND(AVG(busy_ratio)::numeric, 6) AS avg_top_busy_ratio
+FROM top_instances ti
+JOIN metagraph_nodes mn ON mn.hotkey = ti.miner_hotkey AND mn.netuid = 64
+GROUP BY miner_hotkey
+ORDER BY avg_top_busy_ratio DESC;
+"""
 
 
 class IntegrityViolation(RuntimeError): ...
@@ -495,7 +547,7 @@ class Auditor:
             raise Exception("Failed to load metagraph nodes!")
         async with get_session() as session:
             hotkeys = ", ".join([f"'{node.hotkey}'" for node in nodes])
-            result = await session.execute(
+            await session.execute(
                 text(
                     f"DELETE FROM metagraph_nodes WHERE netuid = 64 AND hotkey NOT IN ({hotkeys}) AND node_id >= 0"
                 )
@@ -507,11 +559,13 @@ class Auditor:
                 statement = pg_insert(MetagraphNode).values(node_dict)
                 statement = statement.on_conflict_do_update(
                     index_elements=["hotkey"],
-                    set_={key: getattr(statement.excluded, key) for key, value in node_dict.items()},
+                    set_={
+                        key: getattr(statement.excluded, key) for key, value in node_dict.items()
+                    },
                     where=MetagraphNode.checksum != node_dict["checksum"],
                 )
                 await session.execute(statement)
-            logger.info(f"Successfully synced metagraph nodes for netuid 64.")
+            logger.info("Successfully synced metagraph nodes for netuid 64.")
             await session.commit()
 
     async def sync_gpu_counts(self):
@@ -526,8 +580,10 @@ class Auditor:
             await session.execute(text("DELETE FROM gpu_counts"))
             for info in gpu_counts:
                 await session.execute(
-                    text("INSERT INTO gpu_counts (chute_id, gpu_count) VALUES (:chute_id, :gpu_count) ON CONFLICT (chute_id) DO NOTHING"),
-                    {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]}
+                    text(
+                        "INSERT INTO gpu_counts (chute_id, gpu_count) VALUES (:chute_id, :gpu_count) ON CONFLICT (chute_id) DO NOTHING"
+                    ),
+                    {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]},
                 )
             await session.commit()
 
@@ -1286,11 +1342,20 @@ class Auditor:
                 hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
 
         query = text(MINER_METRICS_QUERY)
+        util_query = text(UTILIZATION_RATIO_QUERY)
         raw_compute_values = {}
         async with get_session() as session:
+            utilization_result = await session.execute(util_query)
+
+            # Get the set of miners with less than useless utilization.
+            utilization = {hotkey: float(ut) for hotkey, ut in utilization_result}
+
             compute_result = await session.execute(query)
             for hotkey, invocation_count, bounty_count, compute_units in compute_result:
                 if hotkey is None:
+                    continue
+                if (ut := utilization.get(hotkey, 0.0)) < UTILIZATION_THRESHOLD:
+                    logger.warning(f"Miner {hotkey} has utilization ratio {ut}, zero score...")
                     continue
                 raw_compute_values[hotkey] = {
                     "invocation_count": invocation_count,
@@ -1304,12 +1369,7 @@ class Auditor:
                 if miner_hotkey is None:
                     continue
                 if miner_hotkey not in raw_compute_values:
-                    raw_compute_values[miner_hotkey] = {
-                        "invocation_count": 0,
-                        "bounty_count": 0,
-                        "compute_units": 0,
-                        "unique_chute_count": 0,
-                    }
+                    continue
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
