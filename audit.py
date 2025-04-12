@@ -281,7 +281,7 @@ WITH instance_spans AS (
     MAX(completed_at) - MIN(started_at) as total_active_time,
     SUM(completed_at - started_at) AS total_processing_time
   FROM invocations
-  WHERE started_at >= now() - INTERVAL '7 days'
+  WHERE started_at >= now() - INTERVAL '8 hours'
   AND error_message IS NULL AND completed_at IS NOT NULL
   GROUP BY miner_hotkey, instance_id
 ),
