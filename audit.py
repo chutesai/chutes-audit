@@ -281,7 +281,7 @@ WITH instance_spans AS (
     MAX(completed_at) - MIN(started_at) as total_active_time,
     SUM(completed_at - started_at) AS total_processing_time
   FROM invocations
-  WHERE started_at >= now() - INTERVAL '8 hours'
+  WHERE started_at >= now() - INTERVAL '{interval}'
   AND error_message IS NULL AND completed_at IS NOT NULL
   GROUP BY miner_hotkey, instance_id
 ),
@@ -315,14 +315,26 @@ top_instances AS (
     total_active_seconds, total_processing_seconds, busy_ratio
   FROM ranked_instances
   WHERE rank <= 3
+),
+instance_counts AS (
+  SELECT
+    miner_hotkey,
+    COUNT(*) AS instance_count
+  FROM top_instances
+  GROUP BY miner_hotkey
 )
 SELECT
-  miner_hotkey,
-  ROUND(AVG(busy_ratio)::numeric, 6) AS avg_top_busy_ratio
-FROM top_instances ti
-JOIN metagraph_nodes mn ON mn.hotkey = ti.miner_hotkey AND mn.netuid = 64
-GROUP BY miner_hotkey
-ORDER BY avg_top_busy_ratio DESC;
+  mn.hotkey AS miner_hotkey,
+  CASE
+    WHEN ic.instance_count >= 3 THEN ROUND(MIN(ti.busy_ratio)::numeric, 6)
+    ELSE 0
+  END AS min_top_busy_ratio
+FROM metagraph_nodes mn
+LEFT JOIN top_instances ti ON mn.hotkey = ti.miner_hotkey
+LEFT JOIN instance_counts ic ON mn.hotkey = ic.miner_hotkey
+WHERE mn.netuid = 64
+GROUP BY mn.hotkey, ic.instance_count
+ORDER BY min_top_busy_ratio DESC;
 """
 
 
@@ -1342,14 +1354,21 @@ class Auditor:
                 hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
 
         query = text(MINER_METRICS_QUERY)
-        util_query = text(UTILIZATION_RATIO_QUERY)
+        util_query = text(UTILIZATION_RATIO_QUERY.format(interval="8 hours"))
         raw_compute_values = {}
         async with get_session() as session:
-            utilization_result = await session.execute(util_query)
+            metagraph_nodes = await session.execute(
+                text(
+                    "SELECT coldkey, hotkey FROM metagraph_nodes WHERE netuid = 64 AND node_id >= 0"
+                )
+            )
+            hot_cold_map = {hotkey: coldkey for coldkey, hotkey in metagraph_nodes}
 
-            # Get the set of miners with less than useless utilization.
+            # Get utilization (worst of top 3 busiest instances matching criteria).
+            utilization_result = await session.execute(util_query)
             utilization = {hotkey: float(ut) for hotkey, ut in utilization_result}
 
+            # Get compute units/total/bounties.
             compute_result = await session.execute(query)
             for hotkey, invocation_count, bounty_count, compute_units in compute_result:
                 if hotkey is None:
@@ -1383,10 +1402,39 @@ class Auditor:
         }
 
         # Adjust the values by the feature weights, e.g. compute_time gets more weight than bounty count.
-        final_scores = {
+        pre_final_scores = {
             hotkey: sum(norm_value * FEATURE_WEIGHTS[key] for key, norm_value in metrics.items())
             for hotkey, metrics in normalized_values.items()
         }
+
+        # Punish multi-uid miners.
+        sorted_hotkeys = sorted(
+            pre_final_scores.keys(), key=lambda h: pre_final_scores[h], reverse=True
+        )
+        coldkey_counts = {
+            coldkey: sum([1 for _, ck in hot_cold_map.items() if ck == coldkey])
+            for coldkey in hot_cold_map.values()
+        }
+        penalized_scores = {}
+        coldkey_used = set()
+        for hotkey in sorted_hotkeys:
+            coldkey = hot_cold_map[hotkey]
+            if coldkey in coldkey_used:
+                logger.warning(
+                    f"Zeroing multi-uid miner {hotkey=} {coldkey=} count={coldkey_counts[coldkey]}"
+                )
+                penalized_scores[hotkey] = 0.0
+            else:
+                penalized_scores[hotkey] = pre_final_scores[hotkey]
+            coldkey_used.add(coldkey)
+
+        # Normalize final scores by sum of penalized scores, just to make the incentive value match nicely.
+        total = sum([val for hk, val in penalized_scores.items()])
+        final_scores = {key: score / total for key, score in penalized_scores.items() if score > 0}
+        sorted_hotkeys = sorted(final_scores.keys(), key=lambda h: final_scores[h], reverse=True)
+        for hotkey in sorted_hotkeys:
+            coldkey_count = coldkey_counts[hot_cold_map[hotkey]]
+            logger.info(f"{hotkey} ({coldkey_count=}): {final_scores[hotkey]}")
 
         # Final weights per node.
         node_ids = []
