@@ -74,9 +74,9 @@ Base = declarative_base()
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 FEATURE_WEIGHTS = {
-    "compute_units": 0.45,  # Total amount of compute time (compute muliplier * total time).
+    "compute_units": 0.5,  # Total amount of compute time (compute muliplier * total time).
     "invocation_count": 0.25,  # Total number of invocations.
-    "unique_chute_count": 0.20,  # Number of unique chutes over the scoring period.
+    "unique_chute_count": 0.15,  # Number of unique chutes over the scoring period.
     "bounty_count": 0.1,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
@@ -1356,6 +1356,7 @@ class Auditor:
         query = text(MINER_METRICS_QUERY)
         util_query = text(UTILIZATION_RATIO_QUERY.format(interval="8 hours"))
         raw_compute_values = {}
+        highest_unique = 0
         async with get_session() as session:
             metagraph_nodes = await session.execute(
                 text(
@@ -1390,16 +1391,32 @@ class Auditor:
                 if miner_hotkey not in raw_compute_values:
                     continue
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
+                if average_active_chutes > highest_unique:
+                    highest_unique = average_active_chutes
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
             key: sum(row[key] for row in raw_compute_values.values()) or 1.0
             for key in FEATURE_WEIGHTS
         }
-        normalized_values = {
-            hotkey: {key: row[key] / totals[key] for key in FEATURE_WEIGHTS}
-            for hotkey, row in raw_compute_values.items()
-        }
+        normalized_values = {}
+        mean_unique_score = totals["unique_chute_count"] / (len(raw_compute_values) or 1)
+        for key in FEATURE_WEIGHTS:
+            for hotkey, row in raw_compute_values.items():
+                if hotkey not in normalized_values:
+                    normalized_values[hotkey] = {}
+                if key == "unique_chute_count":
+                    if row[key] >= mean_unique_score:
+                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 1.2
+                    else:
+                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 2.0
+                else:
+                    normalized_values[hotkey][key] = row[key] / totals[key]
+
+        # Re-normalize unique to [0, 1]
+        unique_sum = sum([val["unique_chute_count"] for val in normalized_values.values()])
+        for hotkey in normalized_values:
+            normalized_values[hotkey]["unique_chute_count"] /= unique_sum
 
         # Adjust the values by the feature weights, e.g. compute_time gets more weight than bounty count.
         pre_final_scores = {
@@ -1541,6 +1558,9 @@ class Auditor:
                 delete_directories.append(f"reports/{entry.entry_id}")
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
+            )
+            await session.execute(
+                text("DELETE FROM invocations WHERE started_at <= NOW() - INTERVAL '7 days 1 hour'")
             )
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
