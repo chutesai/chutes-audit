@@ -74,10 +74,10 @@ Base = declarative_base()
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 FEATURE_WEIGHTS = {
-    "compute_units": 0.5,  # Total amount of compute time (compute muliplier * total time).
+    "compute_units": 0.55,  # Total amount of compute time (compute multiplier * total time).
     "invocation_count": 0.25,  # Total number of invocations.
     "unique_chute_count": 0.15,  # Number of unique chutes over the scoring period.
-    "bounty_count": 0.1,  # Number of bounties received (not bounty values, just counts).
+    "bounty_count": 0.05,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
 WITH computation_rates AS (
@@ -1328,16 +1328,29 @@ class Auditor:
             for key in FEATURE_WEIGHTS
         }
         normalized_values = {}
-        mean_unique_score = totals["unique_chute_count"] / (len(raw_compute_values) or 1)
+        unique_scores = [
+            row["unique_chute_count"]
+            for row in raw_compute_values.values()
+            if row["unique_chute_count"]
+        ]
+        unique_scores.sort()
+        n = len(unique_scores)
+        if n > 0:
+            if n % 2 == 0:
+                median_unique_score = (unique_scores[n // 2 - 1] + unique_scores[n // 2]) / 2
+            else:
+                median_unique_score = unique_scores[n // 2]
+        else:
+            median_unique_score = 0
         for key in FEATURE_WEIGHTS:
             for hotkey, row in raw_compute_values.items():
                 if hotkey not in normalized_values:
                     normalized_values[hotkey] = {}
                 if key == "unique_chute_count":
-                    if row[key] >= mean_unique_score:
-                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 1.2
+                    if row[key] >= median_unique_score:
+                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 1.3
                     else:
-                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 2.0
+                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 2.2
                 else:
                     normalized_values[hotkey][key] = row[key] / totals[key]
 
