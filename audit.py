@@ -270,6 +270,73 @@ ORDER BY COALESCE(i.invocation_count, 0) DESC
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 
+JOBS_QUERY = """
+WITH
+
+-- Count of miner-terminated jobs in the past 7 days
+miner_terminated_counts AS (
+    SELECT
+        miner_hotkey,
+        COUNT(*) as terminated_job_count
+    FROM jobs
+    WHERE (started_at >= now() - interval '7 days' OR finished_at >= now() - interval '7 days')
+      AND miner_terminated = true
+      AND miner_hotkey IS NOT NULL
+    GROUP BY miner_hotkey
+),
+
+-- Compute units/counts for currently in-progress jobs.
+running_jobs_cus AS (
+    SELECT
+        miner_hotkey,
+        SUM(extract(epoch from (now() - started_at)) * compute_multiplier) as running_cus,
+        COUNT(*) as running_job_count
+    FROM jobs
+    WHERE started_at IS NOT NULL
+      AND finished_at IS NULL
+      AND miner_hotkey IS NOT NULL
+      AND EXISTS (SELECT 1 FROM instances WHERE instance_id = jobs.instance_id)
+    GROUP BY miner_hotkey
+),
+
+-- Compute units/counts for jobs completed within the interval.
+completed_jobs_cus AS (
+    SELECT
+        miner_hotkey,
+        SUM(extract(epoch from (finished_at - started_at)) * compute_multiplier) as completed_cus,
+        COUNT(*) as completed_job_count
+    FROM jobs
+    WHERE finished_at >= now() - interval '7 days'
+      AND miner_terminated = false
+      AND started_at IS NOT NULL
+      AND miner_hotkey IS NOT NULL
+    GROUP BY miner_hotkey
+),
+
+-- Combine the results aggregated by hotkeys.
+all_miners AS (
+    SELECT miner_hotkey FROM miner_terminated_counts
+    UNION
+    SELECT miner_hotkey FROM running_jobs_cus
+    UNION
+    SELECT miner_hotkey FROM completed_jobs_cus
+)
+SELECT
+    am.miner_hotkey,
+    COALESCE(mt.terminated_job_count, 0) as terminated_jobs,
+    COALESCE(rj.running_job_count, 0) as running_jobs,
+    COALESCE(cj.completed_job_count, 0) as completed_jobs,
+    COALESCE(rj.running_job_count, 0) + COALESCE(cj.completed_job_count, 0) as total_jobs,
+    COALESCE(rj.running_cus, 0) as current_running_cus,
+    COALESCE(cj.completed_cus, 0) as completed_cus,
+    COALESCE(rj.running_cus, 0) + COALESCE(cj.completed_cus, 0) as total_cus
+FROM all_miners am
+LEFT JOIN miner_terminated_counts mt ON am.miner_hotkey = mt.miner_hotkey
+LEFT JOIN running_jobs_cus rj ON am.miner_hotkey = rj.miner_hotkey
+LEFT JOIN completed_jobs_cus cj ON am.miner_hotkey = cj.miner_hotkey
+ORDER BY terminated_jobs DESC, total_cus DESC;
+"""
+
 
 class IntegrityViolation(RuntimeError): ...
 
@@ -341,6 +408,26 @@ class InstanceAudit(Base):
     created_at = Column(DateTime(timezone=False))
     verified_at = Column(DateTime(timezone=False))
     deleted_at = Column(DateTime(timezone=False))
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+    job_id = Column(String, primary_key=True)
+    chute_id = Column(String, nullable=False)
+    version = Column(String, nullable=False)
+    chutes_version = Column(String, nullable=True)
+    method = Column(String, nullable=False)
+    miner_uid = Column(Integer, nullable=True)
+    miner_hotkey = Column(String, nullable=True)
+    miner_coldkey = Column(String, nullable=True)
+    instance_id = Column(String, nullable=True)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    status = Column(String, nullable=False, default="pending")
+    compute_multiplier = Column(Double, nullable=False)
+    miner_terminated = Column(Boolean, nullable=True, default=False)
 
 
 class MinerMetric(Base):
@@ -1191,7 +1278,38 @@ class Auditor:
                 await session.execute(bulk_insert)
             await session.commit()
         if total:
-            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+            logger.success(f"Successfully loaded {total} reports from {csv_path}")
+
+    async def load_jobs(self, session, csv_path):
+        """
+        Populate our local database with jobs from CSV.
+        """
+        logger.info(f"Inserting jobs records from {csv_path}")
+        total = 0
+        with open(csv_path, "r") as infile:
+            reader = csv.DictReader(infile)
+            batch = []
+            for row in reader:
+                row_data = dict(row)
+                for key in ("created_at", "updated_at", "started_at", "finished_at"):
+                    if row.get(key):
+                        row[key] = datetime.fromisoformat(row[key].rstrip("Z")).replace(tzinfo=None)
+                for key in row_data:
+                    if isinstance(row_data[key], str) and not row_data[key].strip():
+                        row_data[key] = None
+                batch.append(row_data)
+                total += 1
+                if len(batch) == 100:
+                    bulk_insert = pg_insert(Job).values(batch).on_conflict_do_nothing()
+                    await session.execute(bulk_insert)
+                    batch = []
+            if batch:
+                bulk_insert = pg_insert(Job).values(batch).on_conflict_do_nothing()
+                await session.execute(bulk_insert)
+            await session.commit()
+        if total:
+            logger.success(f"Successfully loaded {total} jobs from {csv_path}")
+
 
     async def load_audit_entries(self, record, audit_data):
         """
@@ -1318,6 +1436,27 @@ class Auditor:
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
                 if average_active_chutes > highest_unique:
                     highest_unique = average_active_chutes
+
+            # Jobs.
+            job_result = await session.execute(text(JOBS_QUERY))
+            for (
+                miner_hotkey,
+                terminated_jobs,
+                running_jobs,
+                completed_jobs,
+                total_jobs,
+                current_compute_units,
+                completed_compute_units,
+                total_compute_units,
+            ) in job_result:
+                logger.info(
+                    f"Job stats: {miner_hotkey=} {running_jobs=} {completed_jobs=} {total_jobs=} "
+                    f"{current_compute_units=} {completed_compute_units} {total_compute_units=}"
+                )
+                if miner_hotkey not in raw_compute_values:
+                    continue
+                raw_compute_values[miner_hotkey]["bounty_count"] += total_jobs
+                raw_compute_values[miner_hotkey]["compute_units"] += total_compute_units
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
@@ -1536,7 +1675,7 @@ class Auditor:
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            audit_data, inv_csv_path, reports_csv_path = await self.download_and_check_one(
+            audit_data, inv_csv_path, reports_csv_path, jobs_csv_path = await self.download_and_check_one(
                 db_record
             )
 
@@ -1554,6 +1693,10 @@ class Auditor:
                 # Load reports CSV.
                 if reports_csv_path:
                     await self.load_reports(session, reports_csv_path)
+
+                # Load jobs CSV.
+                if jobs_csv_path:
+                    await self.load_jobs(session, jobs_csv_path)
 
                 # Persist the actual audit entry data.
                 await self.load_audit_entries(db_record, audit_data)
