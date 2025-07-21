@@ -74,42 +74,39 @@ Base = declarative_base()
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 FEATURE_WEIGHTS = {
-    "compute_units": 0.55,  # Total amount of compute time (compute multiplier * total time).
-    "invocation_count": 0.25,  # Total number of invocations.
-    "unique_chute_count": 0.15,  # Number of unique chutes over the scoring period.
-    "bounty_count": 0.05,  # Number of bounties received (not bounty values, just counts).
+    "compute_units": 0.53,  # Total amount of compute time (compute multiplier * total time).
+    "invocation_count": 0.20,  # Total number of invocations.
+    "unique_chute_count": 0.20,  # Number of unique chutes over the scoring period.
+    "bounty_count": 0.07,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
-WITH computation_rates AS (
-    SELECT
-        chute_id,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / (metrics->>'steps')::float) as median_step_time,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / ((metrics->>'it')::float + (metrics->>'ot')::float)) as median_token_time
-    FROM invocations
-    WHERE ((metrics->>'steps' IS NOT NULL and (metrics->>'steps')::float > 0) OR (metrics->>'it' IS NOT NULL AND metrics->>'ot' IS NOT NULL AND (metrics->>'ot')::float > 0 AND (metrics->>'it')::float > 0))
-      AND started_at >= NOW() - INTERVAL '2 days'
-    GROUP BY chute_id
-)
 SELECT
-    i.miner_hotkey,
+    mn.hotkey,
     COUNT(*) as invocation_count,
     COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
+            -- For step-based computations
             WHEN i.metrics->>'steps' IS NOT NULL
-                AND r.median_step_time IS NOT NULL
-            THEN (i.metrics->>'steps')::float * r.median_step_time
+                AND (i.metrics->>'steps')::float > 0
+                AND i.metrics->>'masps' IS NOT NULL
+            THEN (i.metrics->>'steps')::float * (i.metrics->>'masps')::float
+
+            -- For token-based computations (it + ot)
             WHEN i.metrics->>'it' IS NOT NULL
                 AND i.metrics->>'ot' IS NOT NULL
-                AND r.median_token_time IS NOT NULL
-            THEN ((i.metrics->>'it')::float + (i.metrics->>'ot')::float) * r.median_token_time
+                AND (i.metrics->>'it')::float > 0
+                AND (i.metrics->>'ot')::float > 0
+                AND i.metrics->>'maspt' IS NOT NULL
+            THEN ((i.metrics->>'it')::float + (i.metrics->>'ot')::float) * (i.metrics->>'maspt')::float
+
+            -- Fallback to actual elapsed time
             ELSE EXTRACT(EPOCH FROM (i.completed_at - i.started_at))
         END
     ) AS compute_units
 FROM invocations i
-LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
 JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
@@ -121,7 +118,7 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
         WHERE invocation_id = i.parent_invocation_id
         AND confirmed_at IS NOT NULL
     )
-GROUP BY i.miner_hotkey
+GROUP BY mn.hotkey
 ORDER BY compute_units DESC;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
@@ -273,6 +270,72 @@ ORDER BY COALESCE(i.invocation_count, 0) DESC
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 
+JOBS_QUERY = """
+WITH
+
+-- Count of miner-terminated jobs in the past 7 days
+miner_terminated_counts AS (
+    SELECT
+        miner_hotkey,
+        COUNT(*) as terminated_job_count
+    FROM jobs
+    WHERE (started_at >= now() - interval '7 days' OR finished_at >= now() - interval '7 days')
+      AND miner_terminated = true
+      AND miner_hotkey IS NOT NULL
+    GROUP BY miner_hotkey
+),
+
+-- Compute units/counts for currently in-progress jobs.
+running_jobs_cus AS (
+    SELECT
+        miner_hotkey,
+        SUM(extract(epoch from (now() - started_at)) * compute_multiplier) as running_cus,
+        COUNT(*) as running_job_count
+    FROM jobs
+    WHERE started_at IS NOT NULL
+      AND finished_at IS NULL
+      AND miner_hotkey IS NOT NULL
+    GROUP BY miner_hotkey
+),
+
+-- Compute units/counts for jobs completed within the interval.
+completed_jobs_cus AS (
+    SELECT
+        miner_hotkey,
+        SUM(extract(epoch from (finished_at - started_at)) * compute_multiplier) as completed_cus,
+        COUNT(*) as completed_job_count
+    FROM jobs
+    WHERE finished_at >= now() - interval '7 days'
+      AND miner_terminated = false
+      AND started_at IS NOT NULL
+      AND miner_hotkey IS NOT NULL
+    GROUP BY miner_hotkey
+),
+
+-- Combine the results aggregated by hotkeys.
+all_miners AS (
+    SELECT miner_hotkey FROM miner_terminated_counts
+    UNION
+    SELECT miner_hotkey FROM running_jobs_cus
+    UNION
+    SELECT miner_hotkey FROM completed_jobs_cus
+)
+SELECT
+    am.miner_hotkey,
+    COALESCE(mt.terminated_job_count, 0) as terminated_jobs,
+    COALESCE(rj.running_job_count, 0) as running_jobs,
+    COALESCE(cj.completed_job_count, 0) as completed_jobs,
+    COALESCE(rj.running_job_count, 0) + COALESCE(cj.completed_job_count, 0) as total_jobs,
+    COALESCE(rj.running_cus, 0) as current_running_cus,
+    COALESCE(cj.completed_cus, 0) as completed_cus,
+    COALESCE(rj.running_cus, 0) + COALESCE(cj.completed_cus, 0) as total_cus
+FROM all_miners am
+LEFT JOIN miner_terminated_counts mt ON am.miner_hotkey = mt.miner_hotkey
+LEFT JOIN running_jobs_cus rj ON am.miner_hotkey = rj.miner_hotkey
+LEFT JOIN completed_jobs_cus cj ON am.miner_hotkey = cj.miner_hotkey
+ORDER BY terminated_jobs DESC, total_cus DESC;
+"""
+
 
 class IntegrityViolation(RuntimeError): ...
 
@@ -344,6 +407,26 @@ class InstanceAudit(Base):
     created_at = Column(DateTime(timezone=False))
     verified_at = Column(DateTime(timezone=False))
     deleted_at = Column(DateTime(timezone=False))
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+    job_id = Column(String, primary_key=True)
+    chute_id = Column(String, nullable=False)
+    version = Column(String, nullable=False)
+    chutes_version = Column(String, nullable=True)
+    method = Column(String, nullable=False)
+    miner_uid = Column(Integer, nullable=True)
+    miner_hotkey = Column(String, nullable=True)
+    miner_coldkey = Column(String, nullable=True)
+    instance_id = Column(String, nullable=True)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    status = Column(String, nullable=False, default="pending")
+    compute_multiplier = Column(Double, nullable=False)
+    miner_terminated = Column(Boolean, nullable=True, default=False)
 
 
 class MinerMetric(Base):
@@ -1018,12 +1101,14 @@ class Auditor:
         try:
             csv_path.relative_to(os.path.dirname(os.path.abspath(__file__)))
         except ValueError:
+            logger.warning(f"Path {csv_path} attempts to escape base directory!")
             raise ValueError(f"Path {csv_path} attempts to escape base directory!")
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
             csv_content = await csv_resp.read()
             calculated = hashlib.sha256(csv_content).hexdigest()
             if calculated != expected_digest:
+                logger.warning(f"CSV export {remote_path} of validator: {vali_url} does not match!")
                 raise IntegrityViolation(
                     f"CSV export {remote_path} of validator: {vali_url} does not match!"
                 )
@@ -1053,6 +1138,7 @@ class Auditor:
         audit_content = None
         inv_csv_path = None
         reports_csv_path = None
+        jobs_csv_path = None
         data = None
         async with self.aiosession() as session:
             async with session.get(
@@ -1089,6 +1175,19 @@ class Auditor:
                             db_record,
                         )
 
+                    # Jobs CSV exports.
+                    jobs = data.get("csv_exports", {}).get("jobs")
+                    if jobs:
+                        remote_path = jobs["path"].replace("invocations/", "/invocations/exports/")
+                        jobs_csv_path = await self._download_csv(
+                            session,
+                            vali_url,
+                            remote_path,
+                            jobs["path"],
+                            jobs["sha256"],
+                            db_record,
+                        )
+
         # Now we can compare the sha256 of the report to the commitment on chain.
         logger.success(
             f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
@@ -1098,7 +1197,7 @@ class Auditor:
             raise IntegrityViolation(
                 f"Commitment on chain does not match downloaded report! {db_record.record_id}"
             )
-        return data, inv_csv_path, reports_csv_path
+        return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
     async def load_invocations(self, session, csv_path):
         """
@@ -1194,7 +1293,47 @@ class Auditor:
                 await session.execute(bulk_insert)
             await session.commit()
         if total:
-            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+            logger.success(f"Successfully loaded {total} reports from {csv_path}")
+
+    async def load_jobs(self, session, csv_path):
+        """
+        Populate our local database with jobs from CSV.
+        """
+        logger.info(f"Inserting jobs records from {csv_path}")
+        total = 0
+        with open(csv_path, "r") as infile:
+            reader = csv.DictReader(infile)
+            batch = []
+            for row in reader:
+                row_data = dict(row)
+                for key in ("created_at", "updated_at", "started_at", "finished_at"):
+                    if row_data.get(key) and row_data[key].strip():
+                        row_data[key] = datetime.fromisoformat(row_data[key].rstrip("Z")).replace(
+                            tzinfo=None
+                        )
+                for key in row_data:
+                    if isinstance(row_data[key], str) and not row_data[key].strip():
+                        row_data[key] = None
+
+                # Update types.
+                row_data["miner_terminated"] = (
+                    row_data["miner_terminated"].strip().lower() == "true"
+                )
+                row_data["compute_multiplier"] = float(row_data["compute_multiplier"])
+                row_data["miner_uid"] = int(row_data["miner_uid"])
+
+                batch.append(row_data)
+                total += 1
+                if len(batch) == 100:
+                    bulk_insert = pg_insert(Job).values(batch).on_conflict_do_nothing()
+                    await session.execute(bulk_insert)
+                    batch = []
+            if batch:
+                bulk_insert = pg_insert(Job).values(batch).on_conflict_do_nothing()
+                await session.execute(bulk_insert)
+            await session.commit()
+        if total:
+            logger.success(f"Successfully loaded {total} jobs from {csv_path}")
 
     async def load_audit_entries(self, record, audit_data):
         """
@@ -1321,6 +1460,27 @@ class Auditor:
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
                 if average_active_chutes > highest_unique:
                     highest_unique = average_active_chutes
+
+            # Jobs.
+            job_result = await session.execute(text(JOBS_QUERY))
+            for (
+                miner_hotkey,
+                terminated_jobs,
+                running_jobs,
+                completed_jobs,
+                total_jobs,
+                current_compute_units,
+                completed_compute_units,
+                total_compute_units,
+            ) in job_result:
+                logger.info(
+                    f"Job stats: {miner_hotkey=} {running_jobs=} {completed_jobs=} {total_jobs=} "
+                    f"{current_compute_units=} {completed_compute_units} {total_compute_units=}"
+                )
+                if miner_hotkey not in raw_compute_values:
+                    continue
+                raw_compute_values[miner_hotkey]["bounty_count"] += total_jobs
+                raw_compute_values[miner_hotkey]["compute_units"] += total_compute_units
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
@@ -1539,9 +1699,12 @@ class Auditor:
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            audit_data, inv_csv_path, reports_csv_path = await self.download_and_check_one(
-                db_record
-            )
+            (
+                audit_data,
+                inv_csv_path,
+                reports_csv_path,
+                jobs_csv_path,
+            ) = await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:
@@ -1557,6 +1720,10 @@ class Auditor:
                 # Load reports CSV.
                 if reports_csv_path:
                     await self.load_reports(session, reports_csv_path)
+
+                # Load jobs CSV.
+                if jobs_csv_path:
+                    await self.load_jobs(session, jobs_csv_path)
 
                 # Persist the actual audit entry data.
                 await self.load_audit_entries(db_record, audit_data)
