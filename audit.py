@@ -1307,11 +1307,21 @@ class Auditor:
             for row in reader:
                 row_data = dict(row)
                 for key in ("created_at", "updated_at", "started_at", "finished_at"):
-                    if row.get(key):
-                        row[key] = datetime.fromisoformat(row[key].rstrip("Z")).replace(tzinfo=None)
+                    if row_data.get(key) and row_data[key].strip():
+                        row_data[key] = datetime.fromisoformat(row_data[key].rstrip("Z")).replace(
+                            tzinfo=None
+                        )
                 for key in row_data:
                     if isinstance(row_data[key], str) and not row_data[key].strip():
                         row_data[key] = None
+
+                # Update types.
+                row_data["miner_terminated"] = (
+                    row_data["miner_terminated"].strip().lower() == "true"
+                )
+                row_data["compute_multiplier"] = float(row_data["compute_multiplier"])
+                row_data["miner_uid"] = int(row_data["miner_uid"])
+
                 batch.append(row_data)
                 total += 1
                 if len(batch) == 100:
