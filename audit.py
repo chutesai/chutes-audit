@@ -74,42 +74,39 @@ Base = declarative_base()
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 FEATURE_WEIGHTS = {
-    "compute_units": 0.55,  # Total amount of compute time (compute multiplier * total time).
-    "invocation_count": 0.25,  # Total number of invocations.
-    "unique_chute_count": 0.15,  # Number of unique chutes over the scoring period.
-    "bounty_count": 0.05,  # Number of bounties received (not bounty values, just counts).
+    "compute_units": 0.53,  # Total amount of compute time (compute multiplier * total time).
+    "invocation_count": 0.20,  # Total number of invocations.
+    "unique_chute_count": 0.20,  # Number of unique chutes over the scoring period.
+    "bounty_count": 0.07,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
-WITH computation_rates AS (
-    SELECT
-        chute_id,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / (metrics->>'steps')::float) as median_step_time,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from completed_at - started_at) / ((metrics->>'it')::float + (metrics->>'ot')::float)) as median_token_time
-    FROM invocations
-    WHERE ((metrics->>'steps' IS NOT NULL and (metrics->>'steps')::float > 0) OR (metrics->>'it' IS NOT NULL AND metrics->>'ot' IS NOT NULL AND (metrics->>'ot')::float > 0 AND (metrics->>'it')::float > 0))
-      AND started_at >= NOW() - INTERVAL '2 days'
-    GROUP BY chute_id
-)
 SELECT
-    i.miner_hotkey,
+    mn.hotkey,
     COUNT(*) as invocation_count,
     COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
+            -- For step-based computations
             WHEN i.metrics->>'steps' IS NOT NULL
-                AND r.median_step_time IS NOT NULL
-            THEN (i.metrics->>'steps')::float * r.median_step_time
+                AND (i.metrics->>'steps')::float > 0
+                AND i.metrics->>'masps' IS NOT NULL
+            THEN (i.metrics->>'steps')::float * (i.metrics->>'masps')::float
+
+            -- For token-based computations (it + ot)
             WHEN i.metrics->>'it' IS NOT NULL
                 AND i.metrics->>'ot' IS NOT NULL
-                AND r.median_token_time IS NOT NULL
-            THEN ((i.metrics->>'it')::float + (i.metrics->>'ot')::float) * r.median_token_time
+                AND (i.metrics->>'it')::float > 0
+                AND (i.metrics->>'ot')::float > 0
+                AND i.metrics->>'maspt' IS NOT NULL
+            THEN ((i.metrics->>'it')::float + (i.metrics->>'ot')::float) * (i.metrics->>'maspt')::float
+
+            -- Fallback to actual elapsed time
             ELSE EXTRACT(EPOCH FROM (i.completed_at - i.started_at))
         END
     ) AS compute_units
 FROM invocations i
-LEFT JOIN computation_rates r ON i.chute_id = r.chute_id
 JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
@@ -121,7 +118,7 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
         WHERE invocation_id = i.parent_invocation_id
         AND confirmed_at IS NOT NULL
     )
-GROUP BY i.miner_hotkey
+GROUP BY mn.hotkey
 ORDER BY compute_units DESC;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
