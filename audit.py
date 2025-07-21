@@ -1101,12 +1101,14 @@ class Auditor:
         try:
             csv_path.relative_to(os.path.dirname(os.path.abspath(__file__)))
         except ValueError:
+            logger.warning(f"Path {csv_path} attempts to escape base directory!")
             raise ValueError(f"Path {csv_path} attempts to escape base directory!")
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         async with session.get(f"{vali_url}/{remote_path}") as csv_resp:
             csv_content = await csv_resp.read()
             calculated = hashlib.sha256(csv_content).hexdigest()
             if calculated != expected_digest:
+                logger.warning(f"CSV export {remote_path} of validator: {vali_url} does not match!")
                 raise IntegrityViolation(
                     f"CSV export {remote_path} of validator: {vali_url} does not match!"
                 )
@@ -1136,6 +1138,7 @@ class Auditor:
         audit_content = None
         inv_csv_path = None
         reports_csv_path = None
+        jobs_csv_path = None
         data = None
         async with self.aiosession() as session:
             async with session.get(
@@ -1172,6 +1175,19 @@ class Auditor:
                             db_record,
                         )
 
+                    # Jobs CSV exports.
+                    jobs = data.get("csv_exports", {}).get("jobs")
+                    if jobs:
+                        remote_path = jobs["path"].replace("invocations/", "/invocations/exports/")
+                        jobs_csv_path = await self._download_csv(
+                            session,
+                            vali_url,
+                            remote_path,
+                            jobs["path"],
+                            jobs["sha256"],
+                            db_record,
+                        )
+
         # Now we can compare the sha256 of the report to the commitment on chain.
         logger.success(
             f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
@@ -1181,7 +1197,7 @@ class Auditor:
             raise IntegrityViolation(
                 f"Commitment on chain does not match downloaded report! {db_record.record_id}"
             )
-        return data, inv_csv_path, reports_csv_path
+        return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
     async def load_invocations(self, session, csv_path):
         """
@@ -1308,7 +1324,6 @@ class Auditor:
             await session.commit()
         if total:
             logger.success(f"Successfully loaded {total} jobs from {csv_path}")
-
 
     async def load_audit_entries(self, record, audit_data):
         """
@@ -1674,9 +1689,12 @@ class Auditor:
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            audit_data, inv_csv_path, reports_csv_path, jobs_csv_path = await self.download_and_check_one(
-                db_record
-            )
+            (
+                audit_data,
+                inv_csv_path,
+                reports_csv_path,
+                jobs_csv_path,
+            ) = await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:

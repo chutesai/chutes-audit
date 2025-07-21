@@ -56,7 +56,7 @@ def update_local_repo(remote_commit: str):
     time.sleep(5)
 
     logging.info("Finished running the autoupdate steps! Ready to go 😎")
- 
+
 
 def run_auto_updater():
     logging.info("Running the autoupdater! First I'll start 'er up...")
@@ -64,7 +64,7 @@ def run_auto_updater():
     os.system("./utils/launch_auditor.sh")
     time.sleep(60)
     logging.info("Auditor container launched successfully!")
- 
+
     while True:
         logging.info("Checking github for updates to the auditor code...")
         current_branch = subprocess.getoutput("git rev-parse --abbrev-ref HEAD")
@@ -76,7 +76,7 @@ def run_auto_updater():
             logging.info(
                 "Local repo is not up-to-date with github, there's been an update! Updating now..."
             )
-            update_local_repo(remote_commit) 
+            update_local_repo(remote_commit)
 
         else:
             logging.info("Repo is up-to-date.")
