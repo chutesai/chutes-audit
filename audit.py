@@ -295,7 +295,6 @@ running_jobs_cus AS (
     WHERE started_at IS NOT NULL
       AND finished_at IS NULL
       AND miner_hotkey IS NOT NULL
-      AND EXISTS (SELECT 1 FROM instances WHERE instance_id = jobs.instance_id)
     GROUP BY miner_hotkey
 ),
 
