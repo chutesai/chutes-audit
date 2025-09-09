@@ -412,6 +412,10 @@ class InstanceAudit(Base):
     created_at = Column(DateTime(timezone=False))
     verified_at = Column(DateTime(timezone=False))
     deleted_at = Column(DateTime(timezone=False))
+    activated_at = Column(DateTime(timezone=False), nullable=True)
+    stop_billing_at = Column(DateTime(timezone=False), nullable=True)
+    billed_to = Column(String, nullable=True)
+    compute_multiplier = Column(Double, nullable=True)
 
 
 class Job(Base):
@@ -1346,6 +1350,7 @@ class Auditor:
         """
         key = "instance_audit" if record.hotkey in self.validators else "deployment_audit"
         total = 0
+        valid_columns = {c.name for c in InstanceAudit.__table__.columns}
         for item in audit_data.get(key, []):
             try:
                 item["audit_id"] = str(
@@ -1361,19 +1366,24 @@ class Auditor:
                     )
                 )
                 item["entry_id"] = record.entry_id
-                audit = InstanceAudit(**item)
+                audit = InstanceAudit(**{k: v for k, v in item.items() if k in valid_columns})
                 audit.source = "validator" if record.hotkey in self.validators else "miner"
-                audit.created_at = datetime.fromisoformat(audit.created_at.rstrip("Z")).replace(
-                    tzinfo=None
-                )
-                if audit.verified_at:
-                    audit.verified_at = datetime.fromisoformat(
-                        audit.verified_at.rstrip("Z")
-                    ).replace(tzinfo=None)
-                if audit.deleted_at:
-                    audit.deleted_at = datetime.fromisoformat(audit.deleted_at.rstrip("Z")).replace(
-                        tzinfo=None
-                    )
+                for field in (
+                    "created_at",
+                    "verified_at",
+                    "deleted_at",
+                    "activated_at",
+                    "stop_billing_at",
+                ):
+                    value = getattr(audit, field, None)
+                    if value:
+                        setattr(
+                            audit,
+                            field,
+                            datetime.fromisoformat(value.rstrip("Z")).replace(tzinfo=None),
+                        )
+                if not audit.billed_to:
+                    audit.billed_to = None
                 if audit.miner_uid is not None:
                     audit.miner_uid = int(audit.miner_uid)
                 async with get_session() as session:
@@ -1399,12 +1409,15 @@ class Auditor:
         Load the miner-reported metrics for a given report.
         """
         total = 0
+        valid_columns = {c.name for c in MinerMetric.__table__.columns}
         for item in audit_data.get("prometheus_metrics", []):
             try:
                 async with get_session() as session:
                     item["entry_id"] = record.entry_id
                     item["hotkey"] = record.hotkey
-                    session.add(MinerMetric(**item))
+                    session.add(
+                        MinerMetric(**{k: v for k, v in item.items() if k in valid_columns})
+                    )
                     await session.commit()
                     total += 1
             except Exception as exc:
@@ -1909,6 +1922,31 @@ class Auditor:
         """
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+            await conn.execute(
+                text("""
+                ALTER TABLE instance_audits
+                ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP WITHOUT TIME ZONE;
+            """)
+            )
+            await conn.execute(
+                text("""
+                ALTER TABLE instance_audits
+                ADD COLUMN IF NOT EXISTS stop_billing_at TIMESTAMP WITHOUT TIME ZONE;
+            """)
+            )
+            await conn.execute(
+                text("""
+                ALTER TABLE instance_audits
+                ADD COLUMN IF NOT EXISTS billed_to VARCHAR;
+            """)
+            )
+            await conn.execute(
+                text("""
+                ALTER TABLE instance_audits
+                ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
+            """)
+            )
 
         tasks = []
         try:
