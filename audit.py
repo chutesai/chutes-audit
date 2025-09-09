@@ -1958,8 +1958,23 @@ class Auditor:
                 )
                 json_path = Path(os.path.join("/reports", db_record.entry_id, db_record.path))
                 if not json_path.exists():
-                    logger.warning(f"JSON file not found for {db_record.entry_id}: {json_path}")
-                    continue
+                    logger.info(f"{db_record.path} not found, attempting to download...")
+                    json_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                "https://api.chutes.ai/audit/download",
+                                params={"path": db_record.path},
+                            ) as resp:
+                                with open(json_path, "wb") as outfile:
+                                    audit_content = await resp.read()
+                                    outfile.write(audit_content)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed attempt to re-download {db_record.path}: {str(exc)}"
+                        )
+                        continue
+
                 logger.info(
                     f"Recovering instance_audits for entry_id={db_record.entry_id} from {json_path}"
                 )
