@@ -3,7 +3,9 @@ import os
 import re
 import csv
 import ast
+import sys
 import uuid
+import glob
 import shutil
 import random
 import aiohttp
@@ -34,6 +36,7 @@ from loguru import logger
 from typing import AsyncGenerator
 from pydantic import BaseModel
 from substrateinterface import SubstrateInterface
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1106,9 +1109,9 @@ class Auditor:
     async def _download_csv(self, session, vali_url, remote_path, path, expected_digest, db_record):
         # Download any reports.
         logger.info(f"Downloading and verifying {remote_path}")
-        csv_path = Path(os.path.join("reports", db_record.entry_id, path)).resolve()
+        csv_path = Path(os.path.join("/reports", db_record.entry_id, path)).resolve()
         try:
-            csv_path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+            csv_path.relative_to("/reports")
         except ValueError:
             logger.warning(f"Path {csv_path} attempts to escape base directory!")
             raise ValueError(f"Path {csv_path} attempts to escape base directory!")
@@ -1138,9 +1141,9 @@ class Auditor:
         Download and verify a single audit report (and the associated CSV exports if from validator).
         """
         # Download all exports from the validator.
-        path = Path(os.path.join("reports", db_record.entry_id, db_record.path)).resolve()
+        path = Path(os.path.join("/reports", db_record.entry_id, db_record.path)).resolve()
         try:
-            path.relative_to(os.path.dirname(os.path.abspath(__file__)))
+            path.relative_to("/reports")
         except ValueError:
             raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1366,8 +1369,10 @@ class Auditor:
                     )
                 )
                 item["entry_id"] = record.entry_id
-                audit = InstanceAudit(**{k: v for k, v in item.items() if k in valid_columns})
-                audit.source = "validator" if record.hotkey in self.validators else "miner"
+                audit_data_dict = {k: v for k, v in item.items() if k in valid_columns}
+                audit_data_dict["source"] = (
+                    "validator" if record.hotkey in self.validators else "miner"
+                )
                 for field in (
                     "created_at",
                     "verified_at",
@@ -1375,21 +1380,22 @@ class Auditor:
                     "activated_at",
                     "stop_billing_at",
                 ):
-                    value = getattr(audit, field, None)
+                    value = audit_data_dict.get(field)
                     if value:
-                        setattr(
-                            audit,
-                            field,
-                            datetime.fromisoformat(value.rstrip("Z")).replace(tzinfo=None),
+                        audit_data_dict[field] = datetime.fromisoformat(value.rstrip("Z")).replace(
+                            tzinfo=None
                         )
-                if not audit.billed_to:
-                    audit.billed_to = None
-                if audit.miner_uid is not None:
-                    audit.miner_uid = int(audit.miner_uid)
+                if not audit_data_dict.get("billed_to"):
+                    audit_data_dict["billed_to"] = None
+                if audit_data_dict.get("miner_uid") is not None:
+                    audit_data_dict["miner_uid"] = int(audit_data_dict["miner_uid"])
                 async with get_session() as session:
-                    session.add(audit)
+                    stmt = insert(InstanceAudit).values(**audit_data_dict)
+                    stmt = stmt.on_conflict_do_nothing(index_elements=["audit_id"])
+                    result = await session.execute(stmt)
                     await session.commit()
-                total += 1
+                    if result.rowcount > 0:
+                        total += 1
             except Exception as exc:
                 logger.error(
                     f"Error populating instance audit data from {record.hotkey} {record.entry_id=}: {exc}"
@@ -1674,7 +1680,7 @@ class Auditor:
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
                 await session.delete(entry)
-                delete_directories.append(f"reports/{entry.entry_id}")
+                delete_directories.append(f"/reports/{entry.entry_id}")
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
@@ -1916,6 +1922,59 @@ class Auditor:
                 )
                 await asyncio.sleep(30)
 
+    async def recover_instance_audits(self):
+        """
+        Recovery function to re-populate missing instance_audits data from existing JSON files from
+        upstream schema change causing InstanceAudit(**_) constructor errors.
+        """
+        async with get_session() as session:
+            query = """
+                SELECT ae.*
+                FROM audit_entries ae
+                WHERE ae.hotkey = ANY(:validator_hotkeys)
+                AND NOT EXISTS (
+                    SELECT 1 FROM instance_audits ia
+                    WHERE ia.entry_id = ae.entry_id
+                )
+                ORDER BY ae.created_at DESC
+            """
+            result = await session.execute(
+                text(query), {"validator_hotkeys": list(self.validators)}
+            )
+            entries_to_recover = result.fetchall()
+            if not entries_to_recover:
+                logger.info("No entries need recovery")
+                return
+            logger.info(f"Found {len(entries_to_recover)} entries to recover")
+            for row in entries_to_recover:
+                db_record = AuditEntry(
+                    entry_id=row.entry_id,
+                    hotkey=row.hotkey,
+                    block=row.block,
+                    path=row.path,
+                    created_at=row.created_at,
+                    start_time=row.start_time,
+                    end_time=row.end_time,
+                )
+                json_path = Path(os.path.join("/reports", db_record.entry_id, db_record.path))
+                if not json_path.exists():
+                    logger.warning(f"JSON file not found for {db_record.entry_id}: {json_path}")
+                    continue
+                logger.info(
+                    f"Recovering instance_audits for entry_id={db_record.entry_id} from {json_path}"
+                )
+                try:
+                    with open(json_path, "r") as f:
+                        audit_data = json.loads(f.read())
+                    await self.load_audit_entries(db_record, audit_data)
+                    logger.success(
+                        f"Successfully recovered instance_audits for {db_record.entry_id}"
+                    )
+                except Exception as exc:
+                    logger.error(f"Failed to recover {db_record.entry_id}: {exc}")
+                    continue
+        logger.success("Recovery complete")
+
     async def run(self):
         """
         Main loop, to do all the things.
@@ -1959,9 +2018,28 @@ class Auditor:
             await asyncio.gather(*tasks)
 
 
+def fix_reports_path():
+    if not glob.glob("/reports/**/*.json", recursive=True) and glob.glob(
+        "/audit/reports/**/*.json", recursive=True
+    ):
+        source_dir = "/audit/reports"
+        dest_dir = "/reports"
+        for item in os.listdir(source_dir):
+            source_item = os.path.join(source_dir, item)
+            dest_item = os.path.join(dest_dir, item)
+            shutil.move(source_item, dest_item)
+            logger.info(f"Moved: {source_item} -> {dest_item}")
+        os.rmdir(source_dir)
+        logger.success(f"Removed empty directory: {source_dir}")
+
+
 async def main():
     auditor = Auditor()
-    await auditor.run()
+    fix_reports_path()
+    if "--recover" in sys.argv:
+        await auditor.recover_instance_audits()
+    else:
+        await auditor.run()
 
 
 if __name__ == "__main__":
