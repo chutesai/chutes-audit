@@ -278,70 +278,54 @@ ORDER BY COALESCE(i.invocation_count, 0) DESC
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 
-JOBS_QUERY = """
-WITH
-
--- Count of miner-terminated jobs in the past 7 days
-miner_terminated_counts AS (
+PRIVATE_INSTANCES_QUERY = """
+WITH deduplicated_instance_audit AS (
+    SELECT
+        instance_id,
+        (array_agg(miner_hotkey ORDER BY verified_at DESC NULLS LAST))[1] as miner_hotkey,
+        (array_agg(billed_to ORDER BY verified_at DESC NULLS LAST))[1] as billed_to,
+        (array_agg(compute_multiplier ORDER BY verified_at DESC NULLS LAST))[1] as compute_multiplier,
+        MIN(activated_at) as activated_at,
+        MAX(stop_billing_at) as stop_billing_at,
+        MAX(deleted_at) as deleted_at
+    FROM instance_audits
+    WHERE billed_to IS NOT NULL
+      AND activated_at IS NOT NULL
+    GROUP BY instance_id
+),
+billed_instances AS (
+    SELECT
+        ia.miner_hotkey,
+        ia.instance_id,
+        ia.activated_at,
+        ia.stop_billing_at,
+        ia.compute_multiplier,
+        GREATEST(ia.activated_at, now() - interval '{interval}') as billing_start,
+        LEAST(
+            COALESCE(ia.stop_billing_at, now()),
+            COALESCE(ia.deleted_at, now()),
+            now()
+        ) as billing_end
+    FROM deduplicated_instance_audit ia
+    WHERE (ia.stop_billing_at IS NULL OR ia.stop_billing_at >= now() - interval '{interval}')
+),
+miner_compute_units AS (
     SELECT
         miner_hotkey,
-        COUNT(*) as terminated_job_count
-    FROM jobs
-    WHERE (started_at >= now() - interval '7 days' OR finished_at >= now() - interval '7 days')
-      AND miner_terminated = true
-      AND miner_hotkey IS NOT NULL
+        COUNT(*) as total_instances,
+        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start))) as compute_seconds,
+        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)) * compute_multiplier) as compute_units
+    FROM billed_instances
+    WHERE billing_end > billing_start
     GROUP BY miner_hotkey
-),
-
--- Compute units/counts for currently in-progress jobs.
-running_jobs_cus AS (
-    SELECT
-        miner_hotkey,
-        SUM(extract(epoch from (now() - started_at)) * compute_multiplier) as running_cus,
-        COUNT(*) as running_job_count
-    FROM jobs
-    WHERE started_at IS NOT NULL
-      AND finished_at IS NULL
-      AND miner_hotkey IS NOT NULL
-    GROUP BY miner_hotkey
-),
-
--- Compute units/counts for jobs completed within the interval.
-completed_jobs_cus AS (
-    SELECT
-        miner_hotkey,
-        SUM(extract(epoch from (finished_at - started_at)) * compute_multiplier) as completed_cus,
-        COUNT(*) as completed_job_count
-    FROM jobs
-    WHERE finished_at >= now() - interval '7 days'
-      AND miner_terminated = false
-      AND started_at IS NOT NULL
-      AND miner_hotkey IS NOT NULL
-    GROUP BY miner_hotkey
-),
-
--- Combine the results aggregated by hotkeys.
-all_miners AS (
-    SELECT miner_hotkey FROM miner_terminated_counts
-    UNION
-    SELECT miner_hotkey FROM running_jobs_cus
-    UNION
-    SELECT miner_hotkey FROM completed_jobs_cus
 )
 SELECT
-    am.miner_hotkey,
-    COALESCE(mt.terminated_job_count, 0) as terminated_jobs,
-    COALESCE(rj.running_job_count, 0) as running_jobs,
-    COALESCE(cj.completed_job_count, 0) as completed_jobs,
-    COALESCE(rj.running_job_count, 0) + COALESCE(cj.completed_job_count, 0) as total_jobs,
-    COALESCE(rj.running_cus, 0) as current_running_cus,
-    COALESCE(cj.completed_cus, 0) as completed_cus,
-    COALESCE(rj.running_cus, 0) + COALESCE(cj.completed_cus, 0) as total_cus
-FROM all_miners am
-LEFT JOIN miner_terminated_counts mt ON am.miner_hotkey = mt.miner_hotkey
-LEFT JOIN running_jobs_cus rj ON am.miner_hotkey = rj.miner_hotkey
-LEFT JOIN completed_jobs_cus cj ON am.miner_hotkey = cj.miner_hotkey
-ORDER BY terminated_jobs DESC, total_cus DESC;
+    miner_hotkey,
+    total_instances,
+    COALESCE(compute_seconds, 0) as compute_seconds,
+    COALESCE(compute_units, 0) as compute_units
+FROM miner_compute_units
+ORDER BY compute_units DESC;
 """
 
 
@@ -1485,26 +1469,19 @@ class Auditor:
                 if average_active_chutes > highest_unique:
                     highest_unique = average_active_chutes
 
-            # Jobs.
-            job_result = await session.execute(text(JOBS_QUERY))
-            for (
-                miner_hotkey,
-                terminated_jobs,
-                running_jobs,
-                completed_jobs,
-                total_jobs,
-                current_compute_units,
-                completed_compute_units,
-                total_compute_units,
-            ) in job_result:
-                logger.info(
-                    f"Job stats: {miner_hotkey=} {running_jobs=} {completed_jobs=} {total_jobs=} "
-                    f"{current_compute_units=} {completed_compute_units} {total_compute_units=}"
-                )
+            # Private instances.
+            private_result = await session.execute(text(PRIVATE_INSTANCES_QUERY))
+            for miner_hotkey, total_instances, seconds, compute_units in private_result:
                 if miner_hotkey not in raw_compute_values:
                     continue
-                raw_compute_values[miner_hotkey]["bounty_count"] += total_jobs
-                raw_compute_values[miner_hotkey]["compute_units"] += total_compute_units
+                logger.info(
+                    f"{miner_hotkey=} had {total_instances} private instances, {seconds=} {compute_units=}"
+                )
+                raw_compute_values[miner_hotkey]["bounty_count"] += total_instances
+                raw_compute_values[miner_hotkey]["compute_units"] += compute_units
+
+                # XXX Subject to change, but for now give one invocation per second for private instances.
+                raw_compute_values[miner_hotkey]["invocation_count"] += int(seconds)
 
         # Normalize the values based on totals so they are all in the range [0.0, 1.0]
         totals = {
