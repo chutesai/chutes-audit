@@ -300,14 +300,14 @@ billed_instances AS (
         ia.activated_at,
         ia.stop_billing_at,
         ia.compute_multiplier,
-        GREATEST(ia.activated_at, now() - interval '{interval}') as billing_start,
+        GREATEST(ia.activated_at, now() - interval '7 days') as billing_start,
         LEAST(
             COALESCE(ia.stop_billing_at, now()),
             COALESCE(ia.deleted_at, now()),
             now()
         ) as billing_end
     FROM deduplicated_instance_audit ia
-    WHERE (ia.stop_billing_at IS NULL OR ia.stop_billing_at >= now() - interval '{interval}')
+    WHERE (ia.stop_billing_at IS NULL OR ia.stop_billing_at >= now() - interval '7 days')
 ),
 miner_compute_units AS (
     SELECT
