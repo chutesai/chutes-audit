@@ -662,7 +662,7 @@ class Auditor:
         logger.debug("Loading chutes from API...")
         async with self.aiosession() as session:
             async with session.get(
-                "https://api.chutes.ai/chutes/?include_public=true&limit=1000"
+                "https://api.chutes.ai/chutes/?include_public=true&limit=1000&exclude=affine"
             ) as resp:
                 data = await resp.json()
                 chutes = {}
