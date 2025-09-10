@@ -77,10 +77,10 @@ Base = declarative_base()
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 FEATURE_WEIGHTS = {
-    "compute_units": 0.53,  # Total amount of compute time (compute multiplier * total time).
+    "compute_units": 0.52,  # Total amount of compute time (compute multiplier * total time).
     "invocation_count": 0.20,  # Total number of invocations.
     "unique_chute_count": 0.20,  # Number of unique chutes over the scoring period.
-    "bounty_count": 0.07,  # Number of bounties received (not bounty values, just counts).
+    "bounty_count": 0.08,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
 SELECT
