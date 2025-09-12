@@ -8,6 +8,9 @@ In order to fully verify all blocks in the 7 day audit window, you must either u
 64GB+ RAM
 1TB+ (fast) disk
 
+#### Postgres configuration
+Based on the number of cores, RAM, etc., you will likely wish to change the postgres command in the docker-compose.yml file increasing or decreasing various values accordingly.
+
 ### Initial sync
 The first time you run this, it takes an extremely long time to sync, upwards of 20+ hours. Using faster disks/CPU and more RAM will help. Until the initial sync is finished, you will not set weights.
 
