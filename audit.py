@@ -2003,7 +2003,7 @@ class Auditor:
             )
             await conn.execute(
                 text("""
-                CREATE INDEX idx_invocations_started_recent ON invocations (started_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_invocations_started_recent ON invocations (started_at DESC)
                 WHERE completed_at IS NOT NULL
                   AND (error_message IS NULL OR error_message = '')
                   AND miner_uid >= 0;
