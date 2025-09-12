@@ -1189,7 +1189,9 @@ class Auditor:
             f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
             f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
         )
-        if not self.check_audit_report_integrity(db_record, path, audit_content):
+        if db_record.hotkey in self.validators and not self.check_audit_report_integrity(
+            db_record, path, audit_content
+        ):
             raise IntegrityViolation(
                 f"Commitment on chain does not match downloaded report! {db_record.record_id}"
             )
