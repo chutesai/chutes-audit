@@ -126,8 +126,7 @@ WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
         WHERE invocation_id = i.parent_invocation_id
         AND confirmed_at IS NOT NULL
     )
-GROUP BY mn.hotkey
-ORDER BY compute_units DESC;
+GROUP BY mn.hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
 WITH time_series AS (
@@ -245,8 +244,7 @@ SELECT
   miner_hotkey,
   AVG(gpu_weighted_chutes)::integer AS avg_gpu_weighted_chutes
 FROM complete_dataset
-GROUP BY miner_hotkey
-ORDER BY avg_gpu_weighted_chutes DESC;
+GROUP BY miner_hotkey;
 """
 MISSING_INVOCATIONS_QUERY = """
 SELECT s.*
@@ -272,8 +270,7 @@ FULL OUTER JOIN
    (SELECT hotkey, SUM(total_count) as metrics_count
     FROM miner_metrics
     GROUP BY hotkey) m
-ON i.miner_hotkey = m.hotkey
-ORDER BY COALESCE(i.invocation_count, 0) DESC
+ON i.miner_hotkey = m.hotkey;
 """
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
@@ -324,8 +321,7 @@ SELECT
     total_instances,
     COALESCE(compute_seconds, 0) as compute_seconds,
     COALESCE(compute_units, 0) as compute_units
-FROM miner_compute_units
-ORDER BY compute_units DESC;
+FROM miner_compute_units;
 """
 
 
@@ -1999,6 +1995,19 @@ class Auditor:
                 ALTER TABLE instance_audits
                 ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
             """)
+            )
+            await conn.execute(
+                text("""
+                CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;
+                """)
+            )
+            await conn.execute(
+                text("""
+                CREATE INDEX idx_invocations_started_recent ON invocations (started_at DESC)
+                WHERE completed_at IS NOT NULL
+                  AND (error_message IS NULL OR error_message = '')
+                  AND miner_uid >= 0;
+                """)
             )
 
         tasks = []
