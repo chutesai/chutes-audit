@@ -3,6 +3,11 @@ This system is designed to help prove fairness of distribution of requests from 
 
 In order to fully verify all blocks in the 7 day audit window, you must either use an archive subtensor node, or a local subtensor with `--state-pruning 60000` to ensure you keep sufficient blocks to verify against the `set_commitment` calls.
 
+### Recommended machine specs
+16+ CPU cores
+64GB+ RAM
+1TB+ (fast) disk
+
 ### Synthetics to help guarantee completeness of audit exports/weights
 If configured with synthetics.enabled and a valid API key, the auditing system will continuously generates synthetics for all of the various standard templates. For each request, it will use the chutes invocation tracing system to get exactly which miner the request was routed to, any errors that trigger retry to another miner, etc., and verify that each and every one of those synthetics show up in the audit exports from the validator. Invocations should ALWAYS show up in the invocation exports the audit system pulls.
 Example trace:
@@ -80,3 +85,4 @@ __Option 3:__ install python, poetry, etc., and use it without docker
 You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
 You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
 Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
+
