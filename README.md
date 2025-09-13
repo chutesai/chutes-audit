@@ -4,15 +4,17 @@ This system is designed to help prove fairness of distribution of requests from 
 In order to fully verify all blocks in the 7 day audit window, you must either use an archive subtensor node, or a local subtensor with `--state-pruning 60000` to ensure you keep sufficient blocks to verify against the `set_commitment` calls.
 
 ### Recommended machine specs
-- 8+ CPU cores
+- 16+ CPU cores
   - Note that single core performance is very critical here as well, please select a fast CPU (3+ghz for example)
   - If you must make a trade-off between more cores vs fewer but faster cores, you will likely benefit from choosing faster (but adjust the docker-compose yaml accordingly on worker counts/etc. to match your specs)
-- 32gb+ RAM ideally, but can function with lesser amount
+- 64gb+ RAM ideally, but can function with lesser amount
   - Adjust the docker compose yaml accordingly, e.g. shm size, postgres cache sizes, etc.
 - 1TB+ (fast) disk
   - This should really but a locally attached NVMe/SSD, preferably a raid 1 or 10 for some resiliency
   - Try to avoid network attached storage or shared drives which may encounter high latency, low IOPS, etc.
   - Disk performance is quite important here since the majority of calculations take place in postgres.
+ 
+You can use lower spec machines but performance will be sub-optimal of course, and see below - likely need to tweak settings.
 
 #### Postgres configuration
 Based on the number of cores, RAM, etc., you will likely wish to change the postgres command in the docker-compose.yml file increasing or decreasing various values accordingly.
@@ -97,6 +99,7 @@ __Option 3:__ install python, poetry, etc., and use it without docker
 You will need to install `portaudio2` or disable audio rendering e.g. `sudo apt-get -y install libportaudio2`
 You will also need poetry for dependency management (or you can parse out requirements from `pyproject.toml`), e.g. `curl -sSL https://install.python-poetry.org | python3 -`
 Make sure you have postgres running locally (which you can do using the provided docker compose file if you wish), and set the `POSTGRESQL` environment variable, e.g.: `export POSTGRESQL='postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit'`
+
 
 
 
