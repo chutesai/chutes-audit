@@ -59,6 +59,7 @@ from sqlalchemy import (
     ForeignKey,
     text,
     Index,
+    exists,
 )
 from munch import munchify
 from datasets import load_dataset
@@ -1767,9 +1768,19 @@ class Auditor:
         # Clean up the old data, plus get a list of existing items to skip.
         delete_directories = []
         async with get_session() as session:
-            query = select(AuditEntry).where(
-                AuditEntry.created_at
-                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+            query = (
+                select(AuditEntry)
+                .where(
+                    AuditEntry.created_at
+                    <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+                )
+                .where(
+                    exists(
+                        select(1)
+                        .where(Invocation.started_at >= AuditEntry.start_time)
+                        .where(Invocation.started_at <= AuditEntry.end_time)
+                    )
+                )
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
