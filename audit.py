@@ -44,7 +44,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import (
     Column,
     String,
@@ -59,6 +58,7 @@ from sqlalchemy import (
     ForeignKey,
     text,
     Index,
+    or_,
 )
 from munch import munchify
 from datasets import load_dataset
@@ -93,27 +93,22 @@ FEATURE_WEIGHTS = {
     "bounty_count": 0.08,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
-WITH excluded_reports AS MATERIALIZED (
+WITH excluded_reports AS (
     SELECT invocation_id
     FROM reports
     WHERE confirmed_at IS NOT NULL
 ) SELECT
     i.miner_hotkey AS hotkey,
-    COUNT(CASE WHEN (i.metrics->>'p')::bool IS NOT TRUE AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
-    COUNT(CASE WHEN i.bounty > 0 AND (i.metrics->>'p')::bool IS NOT TRUE THEN 1 END) AS bounty_count,
+    COUNT(CASE WHEN is_private is not true AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
+    COUNT(CASE WHEN i.bounty > 0 AND is_private is not true THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
-            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') THEN 0::float
-
-            -- Private chutes/jobs/etc are accounted for by instance data instead of here.
-            WHEN (i.metrics->>'p')::bool IS TRUE THEN 0::float
+            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') OR is_private is true THEN 0::float
 
             -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
-            WHEN i.metrics->>'nc' IS NOT NULL
-                AND (i.metrics->>'nc')::float > 0
-            THEN (i.metrics->>'nc')::float
+            WHEN normalized_compute IS NOT NULL AND normalized_compute > 0 THEN normalized_compute
 
             -- For step-based computations
             WHEN i.metrics->>'steps' IS NOT NULL
@@ -134,7 +129,7 @@ WITH excluded_reports AS MATERIALIZED (
         END
     ) AS compute_units
 FROM invocations i
-WHERE i.parent_invocation_id NOT IN (SELECT invocation_id FROM excluded_reports)
+WHERE NOT EXISTS ( SELECT 1 FROM reports r WHERE r.confirmed_at IS NOT NULL AND r.invocation_id = i.parent_invocation_id )
 GROUP BY hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
@@ -427,25 +422,26 @@ def process_chunk(chunk):
     return [transform_invocation(row) for row in chunk if int(row["miner_uid"]) >= 0]
 
 
-class Invocation(Base):
-    __tablename__ = "invocations"
-    parent_invocation_id = Column(String)
-    invocation_id = Column(String, primary_key=True)
-    chute_id = Column(String)
-    chute_user_id = Column(String)
-    function_name = Column(String)
-    user_id = Column(String)
-    image_id = Column(String)
-    image_user_id = Column(String)
-    instance_id = Column(String)
-    miner_uid = Column(Integer)
-    miner_hotkey = Column(String)
-    error_message = Column(String)
-    compute_multiplier = Column(Double)
-    bounty = Column(Integer)
-    metrics = Column(JSONB, nullable=True)
-    started_at = Column(DateTime(timezone=False))
-    completed_at = Column(DateTime(timezone=False), nullable=True)
+INVOCATION_COLS = [
+    "entry_id",
+    "parent_invocation_id",
+    "invocation_id",
+    "chute_id",
+    "chute_user_id",
+    "function_name",
+    "user_id",
+    "image_id",
+    "image_user_id",
+    "instance_id",
+    "miner_uid",
+    "miner_hotkey",
+    "error_message",
+    "compute_multiplier",
+    "bounty",
+    "metrics",
+    "started_at",
+    "completed_at",
+]
 
 
 class Report(Base):
@@ -1280,14 +1276,17 @@ class Auditor:
             )
         return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
-    async def load_invocations(self, csv_path: str) -> int:
+    async def load_invocations(self, csv_path: str, entry_id: str) -> int:
         """
         Load (after transform) invocations from CSV export into Postgres.
         """
         logger.info(f"Loading invocation records to transform and load into DB from {csv_path}")
         with open(csv_path, "r", newline="") as infile:
             reader = csv.DictReader(infile)
-            rows = list(reader)
+            rows = []
+            for row in reader:
+                row["entry_id"] = entry_id
+                rows.append(row)
         if not rows:
             logger.info("No rows to process")
             return 0
@@ -1310,15 +1309,23 @@ class Auditor:
             return 0
 
         logger.info(f"Transformation complete, {len(transformed_rows)} rows ready to load...")
-        col_names = [c.name for c in Invocation.__table__.columns]
         timestamp = int(time.time() * 1000)
         temp_csv_path = f"/tmp/invocations_load_{timestamp}.csv"
         try:
             with open(temp_csv_path, "w", newline="") as csvfile:
                 for row in transformed_rows:
-                    fields = [escape_for_copy(row.get(col)) for col in col_names]
+                    fields = [escape_for_copy(row.get(col)) for col in INVOCATION_COLS]
                     csvfile.write("\t".join(fields) + "\n")
             logger.info(f"Wrote {len(transformed_rows)} rows to temporary CSV: {temp_csv_path}")
+            part = f"inv_{entry_id.replace('-', '')}"
+            async with get_session() as session:
+                await session.execute(text(f"DROP TABLE IF EXISTS {part}"))
+                await session.execute(
+                    text(
+                        f"CREATE TABLE {part} PARTITION OF invocations FOR VALUES IN ('{entry_id}')"
+                    )
+                )
+                await session.commit()
             cmd = [
                 "psql",
                 "-h",
@@ -1330,7 +1337,7 @@ class Auditor:
                 "-d",
                 POSTGRES_DB,
                 "-c",
-                f"\\copy invocations ({','.join(col_names)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
+                f"\\copy {part} ({','.join(INVOCATION_COLS)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
             ]
             logger.info("Running psql COPY command...")
             env = os.environ.copy()
@@ -1751,20 +1758,21 @@ class Auditor:
         delete_directories = []
         async with get_session() as session:
             query = select(AuditEntry).where(
-                AuditEntry.created_at
-                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+                or_(
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=7),
+                    AuditEntry.processed.is_(False),
+                )
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
+                await session.execute(
+                    text(f"DROP TABLE IF EXISTS inv_{entry.entry_id.replace('-', '')}")
+                )
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
-            await session.execute(
-                text("DELETE FROM invocations WHERE started_at <= NOW() - INTERVAL '7 days 1 hour'")
-            )
-            await session.execute(text("DELETE FROM audit_entries WHERE processed = false"))
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
@@ -1822,7 +1830,7 @@ class Auditor:
                 )
                 # Load CSV invocation data if it's from a validator.
                 if inv_csv_path:
-                    if await self.load_invocations(inv_csv_path):
+                    if await self.load_invocations(inv_csv_path, db_record.entry_id):
                         await session.execute(
                             text(
                                 "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
@@ -2084,8 +2092,55 @@ class Auditor:
         Main loop, to do all the things.
         """
         async with engine.begin() as conn:
+            await conn.execute(
+                text("""
+                DO $$
+                DECLARE
+                    is_partitioned BOOLEAN;
+                BEGIN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_class c
+                        WHERE c.relname = 'invocations'
+                        AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+                        AND c.relkind = 'r'
+                    ) INTO is_partitioned;
+                    IF is_partitioned THEN
+                        DROP TABLE invocations;
+                        RAISE NOTICE 'Dropped non-partitioned table invocations';
+                    ELSE
+                        RAISE NOTICE 'Table invocations does not exist or is partitioned, skipping drop';
+                    END IF;
+                END $$;
+                """)
+            )
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS invocations (
+                    entry_id text not null,
+                    parent_invocation_id character varying,
+                    invocation_id character varying NOT NULL,
+                    chute_id character varying,
+                    chute_user_id character varying,
+                    function_name character varying,
+                    user_id character varying,
+                    image_id character varying,
+                    image_user_id character varying,
+                    instance_id character varying,
+                    miner_uid integer,
+                    miner_hotkey character varying,
+                    error_message character varying,
+                    compute_multiplier double precision,
+                    bounty integer,
+                    metrics jsonb,
+                    started_at timestamp without time zone,
+                    completed_at timestamp without time zone,
+                    is_private boolean GENERATED ALWAYS AS ((metrics->>'p')::bool) STORED,
+                    normalized_compute double precision GENERATED ALWAYS AS ((metrics->>'nc')::float) STORED
+                ) PARTITION BY LIST(entry_id);
+                """)
+            )
             await conn.run_sync(Base.metadata.create_all)
-
             await conn.execute(
                 text("""
                 ALTER TABLE instance_audits
@@ -2117,7 +2172,7 @@ class Auditor:
             )
             await conn.execute(
                 text(
-                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;"
+                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
                 )
             )
             await conn.execute(

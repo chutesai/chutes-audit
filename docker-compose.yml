@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: chutes_audit
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql/data
     restart: always
     shm_size: 4gb
     command:
@@ -57,6 +57,8 @@ services:
       - autovacuum_max_workers=4
       - -c
       - autovacuum_naptime=10s
+      - -c
+      - work_mem=256MB
   auditor:
     build:
       context: .
@@ -80,5 +82,5 @@ services:
       - postgres
 
 volumes:
-  postgres_data:
+  pg_data:
   hfhub:
