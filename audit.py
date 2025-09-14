@@ -96,8 +96,8 @@ FEATURE_WEIGHTS = {
 MINER_METRICS_QUERY = """
 SELECT
     mn.hotkey,
-    COUNT(*) as invocation_count,
-    COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
+    COUNT(CASE WHEN (i.metrics->>'p')::bool IS NOT TRUE THEN 1 END) as invocation_count,
+    COUNT(CASE WHEN i.bounty > 0 AND (i.metrics->>'p')::bool IS NOT TRUE THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
@@ -130,16 +130,12 @@ SELECT
     ) AS compute_units
 FROM invocations i
 JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
+LEFT JOIN reports r ON r.invocation_id = i.parent_invocation_id AND r.confirmed_at IS NOT NULL
 WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
     AND (i.error_message IS NULL or i.error_message = '')
     AND i.miner_uid >= 0
     AND i.completed_at IS NOT NULL
-    AND NOT EXISTS (
-        SELECT 1
-        FROM reports
-        WHERE invocation_id = i.parent_invocation_id
-        AND confirmed_at IS NOT NULL
-    )
+    AND r.invocation_id IS NULL
 GROUP BY mn.hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
@@ -2133,19 +2129,20 @@ class Auditor:
                 ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
             """)
             )
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invocations_miner_hotkey ON invocations(miner_hotkey);"))
+            await conn.execute(text("DROP INDEX IF EXISTS idx_invocations_started_recent"))
             await conn.execute(
                 text("""
-                CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;
-                """)
-            )
-            await conn.execute(
-                text("""
-                CREATE INDEX IF NOT EXISTS idx_invocations_started_recent ON invocations (started_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_invocations_started_miner_complete
+                ON invocations(started_at DESC, miner_hotkey)
                 WHERE completed_at IS NOT NULL
                   AND (error_message IS NULL OR error_message = '')
                   AND miner_uid >= 0;
                 """)
             )
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invocations_parent_invocation_id ON invocations(parent_invocation_id);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"))
 
         tasks = []
         try:
