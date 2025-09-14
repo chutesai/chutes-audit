@@ -59,7 +59,6 @@ from sqlalchemy import (
     ForeignKey,
     text,
     Index,
-    exists,
 )
 from munch import munchify
 from datasets import load_dataset
@@ -530,6 +529,7 @@ class AuditEntry(Base):
     created_at = Column(DateTime(timezone=False))
     start_time = Column(DateTime(timezone=False))
     end_time = Column(DateTime(timezone=False))
+    processed = Column(Boolean, default=False)
 
 
 class Synthetic(Base):
@@ -1767,19 +1767,9 @@ class Auditor:
         # Clean up the old data, plus get a list of existing items to skip.
         delete_directories = []
         async with get_session() as session:
-            query = (
-                select(AuditEntry)
-                .where(
-                    AuditEntry.created_at
-                    <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
-                )
-                .where(
-                    exists(
-                        select(1)
-                        .where(Invocation.started_at >= AuditEntry.start_time)
-                        .where(Invocation.started_at <= AuditEntry.end_time)
-                    )
-                )
+            query = select(AuditEntry).where(
+                AuditEntry.created_at
+                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
@@ -1792,7 +1782,14 @@ class Auditor:
                 text("DELETE FROM invocations WHERE started_at <= NOW() - INTERVAL '7 days 1 hour'")
             )
             existing_ids = (
-                (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
+                (
+                    await session.execute(
+                        select(AuditEntry.entry_id).where(AuditEntry.processed.is_(True))
+                    )
+                )
+                .unique()
+                .scalars()
+                .all()
             )
         for directory in delete_directories:
             logger.info(f"Purging old data: {directory}")
@@ -1847,7 +1844,13 @@ class Auditor:
                 )
                 # Load CSV invocation data if it's from a validator.
                 if inv_csv_path:
-                    await self.load_invocations(inv_csv_path)
+                    if await self.load_invocations(inv_csv_path):
+                        await session.execute(
+                            text(
+                                "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
+                            ),
+                            {"entry_id": db_record.entry_id},
+                        )
 
                 # Load reports CSV.
                 if reports_csv_path:
@@ -2129,8 +2132,21 @@ class Auditor:
                 ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
             """)
             )
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invocations_miner_hotkey ON invocations(miner_hotkey);"))
+            await conn.execute(
+                text(
+                    "ALTER TABLE audit_entries ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT true"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_invocations_miner_hotkey ON invocations(miner_hotkey);"
+                )
+            )
             await conn.execute(text("DROP INDEX IF EXISTS idx_invocations_started_recent"))
             await conn.execute(
                 text("""
@@ -2141,8 +2157,16 @@ class Auditor:
                   AND miner_uid >= 0;
                 """)
             )
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invocations_parent_invocation_id ON invocations(parent_invocation_id);"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"))
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_invocations_parent_invocation_id ON invocations(parent_invocation_id);"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
+                )
+            )
 
         tasks = []
         try:
