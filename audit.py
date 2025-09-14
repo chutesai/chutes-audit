@@ -102,6 +102,9 @@ SELECT
         i.bounty +
         i.compute_multiplier *
         CASE
+            -- Private chutes/jobs/etc are accounted for by instance data instead of here.
+            WHEN (i.metrics->>'p')::bool IS TRUE THEN 0::float
+
             -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
             WHEN i.metrics->>'nc' IS NOT NULL
                 AND (i.metrics->>'nc')::float > 0
@@ -113,7 +116,7 @@ SELECT
                 AND i.metrics->>'masps' IS NOT NULL
             THEN (i.metrics->>'steps')::float * (i.metrics->>'masps')::float
 
-            -- For token-based computations (it + ot)
+            -- Legacy token-based computations when 'nc' is not available.
             WHEN i.metrics->>'it' IS NOT NULL
                 AND i.metrics->>'ot' IS NOT NULL
                 AND (i.metrics->>'it')::float > 0
