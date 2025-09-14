@@ -1764,15 +1764,9 @@ class Auditor:
             await session.execute(
                 text("DELETE FROM invocations WHERE started_at <= NOW() - INTERVAL '7 days 1 hour'")
             )
+            await session.execute(text("DELETE FROM audit_entries WHERE processed = false"))
             existing_ids = (
-                (
-                    await session.execute(
-                        select(AuditEntry.entry_id).where(AuditEntry.processed.is_(True))
-                    )
-                )
-                .unique()
-                .scalars()
-                .all()
+                (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
         for directory in delete_directories:
             logger.info(f"Purging old data: {directory}")
@@ -1804,6 +1798,7 @@ class Auditor:
                 end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")).replace(
                     tzinfo=None
                 ),
+                processed=record["hotkey"] not in self.validators,
             )
             logger.info(
                 f"Need to verify new audit entry: {db_record.entry_id} "
