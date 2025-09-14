@@ -93,14 +93,20 @@ FEATURE_WEIGHTS = {
     "bounty_count": 0.08,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
-SELECT
-    mn.hotkey,
-    COUNT(CASE WHEN (i.metrics->>'p')::bool IS NOT TRUE THEN 1 END) as invocation_count,
+WITH excluded_reports AS MATERIALIZED (
+    SELECT invocation_id
+    FROM reports
+    WHERE confirmed_at IS NOT NULL
+) SELECT
+    i.miner_hotkey AS hotkey,
+    COUNT(CASE WHEN (i.metrics->>'p')::bool IS NOT TRUE AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
     COUNT(CASE WHEN i.bounty > 0 AND (i.metrics->>'p')::bool IS NOT TRUE THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
+            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') THEN 0::float
+
             -- Private chutes/jobs/etc are accounted for by instance data instead of here.
             WHEN (i.metrics->>'p')::bool IS TRUE THEN 0::float
 
@@ -128,14 +134,8 @@ SELECT
         END
     ) AS compute_units
 FROM invocations i
-JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
-LEFT JOIN reports r ON r.invocation_id = i.parent_invocation_id AND r.confirmed_at IS NOT NULL
-WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
-    AND (i.error_message IS NULL or i.error_message = '')
-    AND i.miner_uid >= 0
-    AND i.completed_at IS NOT NULL
-    AND r.invocation_id IS NULL
-GROUP BY mn.hotkey;
+WHERE i.parent_invocation_id NOT IN (SELECT invocation_id FROM excluded_reports)
+GROUP BY hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
 WITH time_series AS (
@@ -424,7 +424,7 @@ def process_chunk(chunk):
     """
     Process a chunk of invocations.
     """
-    return [transform_invocation(row) for row in chunk]
+    return [transform_invocation(row) for row in chunk if int(row["miner_uid"]) >= 0]
 
 
 class Invocation(Base):
@@ -1319,12 +1319,6 @@ class Auditor:
                     fields = [escape_for_copy(row.get(col)) for col in col_names]
                     csvfile.write("\t".join(fields) + "\n")
             logger.info(f"Wrote {len(transformed_rows)} rows to temporary CSV: {temp_csv_path}")
-            temp_table = f"temp_invocations_{timestamp}"
-            async with get_session() as session:
-                await session.execute(
-                    text(f"CREATE TABLE {temp_table} (LIKE invocations INCLUDING ALL)")
-                )
-                logger.info(f"Created temporary table: {temp_table}")
             cmd = [
                 "psql",
                 "-h",
@@ -1336,7 +1330,7 @@ class Auditor:
                 "-d",
                 POSTGRES_DB,
                 "-c",
-                f"\\copy {temp_table} ({','.join(col_names)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
+                f"\\copy invocations ({','.join(col_names)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
             ]
             logger.info("Running psql COPY command...")
             env = os.environ.copy()
@@ -1345,19 +1339,8 @@ class Auditor:
             if result.returncode != 0:
                 logger.error(f"psql COPY failed: {result.stderr}")
                 raise Exception(f"psql COPY failed: {result.stderr}")
-            logger.info(f"Successfully copied data to temp table {temp_table}")
-            async with get_session() as session:
-                res = await session.execute(
-                    text(f"""
-                        INSERT INTO invocations
-                        SELECT * FROM {temp_table}
-                        ON CONFLICT DO NOTHING
-                    """)
-                )
-                inserted = res.rowcount or 0
-                await session.execute(text(f"DROP TABLE {temp_table}"))
-            logger.success(f"Inserted {inserted} new invocation records (skipped duplicates)")
-            return inserted
+            logger.info("Successfully copied data to invocations table!")
+            return len(transformed_rows)
         except Exception as e:
             logger.error(f"Failed to load invocations: {e}")
             raise
@@ -2144,29 +2127,10 @@ class Auditor:
             )
             await conn.execute(
                 text(
-                    "CREATE INDEX IF NOT EXISTS idx_invocations_miner_hotkey ON invocations(miner_hotkey);"
-                )
-            )
-            await conn.execute(
-                text(
                     "CREATE INDEX IF NOT EXISTS idx_invocations_started ON invocations(started_at);"
                 )
             )
             await conn.execute(text("DROP INDEX IF EXISTS idx_invocations_started_recent"))
-            await conn.execute(
-                text("""
-                CREATE INDEX IF NOT EXISTS idx_invocations_started_miner_complete
-                ON invocations(started_at DESC, miner_hotkey)
-                WHERE completed_at IS NOT NULL
-                  AND (error_message IS NULL OR error_message = '')
-                  AND miner_uid >= 0;
-                """)
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_invocations_parent_invocation_id ON invocations(parent_invocation_id);"
-                )
-            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
