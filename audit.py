@@ -2147,6 +2147,11 @@ class Auditor:
                     "CREATE INDEX IF NOT EXISTS idx_invocations_miner_hotkey ON invocations(miner_hotkey);"
                 )
             )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_invocations_started ON invocations(started_at);"
+                )
+            )
             await conn.execute(text("DROP INDEX IF EXISTS idx_invocations_started_recent"))
             await conn.execute(
                 text("""
