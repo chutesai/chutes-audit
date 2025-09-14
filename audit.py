@@ -149,7 +149,6 @@ instances_with_success AS (
   WHERE
     error_message IS NULL
     AND completed_at IS NOT NULL
-    AND miner_uid >= 0
     AND NOT EXISTS (
         SELECT 1
         FROM reports
@@ -157,14 +156,10 @@ instances_with_success AS (
         AND confirmed_at IS NOT NULL
     )
 ),
--- Get all unique miner_hotkeys for valid miners in the specified subnet from metagraph_nodes
+-- Get all unique miner_hotkeys.
 all_miners AS (
   SELECT DISTINCT ia.miner_hotkey
   FROM instance_audits ia
-  -- Join with metagraph_nodes to filter for valid, registered miners
-  JOIN metagraph_nodes mn ON ia.miner_hotkey = mn.hotkey
-  WHERE mn.netuid = 64
-    AND mn.node_id >= 0
 ),
 -- Get the maximum GPU count ever recorded for each chute_id
 max_gpu_counts AS (
@@ -194,10 +189,6 @@ active_instances_per_timepoint AS (
         ELSE NULL
       END AS earliest_deleted_at
     FROM instance_audits ia_inner
-    -- Join with metagraph_nodes to filter for valid, registered miners
-    JOIN metagraph_nodes mn ON ia_inner.miner_hotkey = mn.hotkey
-    WHERE mn.netuid = 64
-      AND mn.node_id >= 0
     GROUP BY ia_inner.instance_id, ia_inner.chute_id, ia_inner.miner_hotkey
   ) ia ON
     ia.first_verified_at <= ts.time_point AND
@@ -268,7 +259,6 @@ FROM
     WHERE error_message is null
     AND miner_hotkey is not null
     AND completed_at is not null
-    AND miner_uid >= 0
     GROUP BY miner_hotkey) i
 FULL OUTER JOIN
    (SELECT hotkey, SUM(total_count) as metrics_count
@@ -1557,7 +1547,7 @@ class Auditor:
             # Get compute units/total/bounties.
             compute_result = await session.execute(query)
             for hotkey, invocation_count, bounty_count, compute_units in compute_result:
-                if hotkey is None:
+                if hotkey is None or hotkey not in hot_cold_map:
                     continue
                 raw_compute_values[hotkey] = {
                     "invocation_count": invocation_count,
@@ -1568,9 +1558,7 @@ class Auditor:
             unique_query = text(UNIQUE_CHUTE_AVERAGE_QUERY)
             unique_result = await session.execute(unique_query)
             for miner_hotkey, average_active_chutes in unique_result:
-                if miner_hotkey is None:
-                    continue
-                if miner_hotkey not in raw_compute_values:
+                if miner_hotkey is None or miner_hotkey not in raw_compute_values:
                     continue
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
                 if average_active_chutes > highest_unique:
@@ -1941,23 +1929,25 @@ class Auditor:
                         )
 
             # Compare prometheus metrics first.
-            logger.info(
-                "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
-            )
-            metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
-            for row in metrics:
-                hotkey, audit_count, reported_count = row
-                if not audit_count or not reported_count:
-                    logger.warning(f"Miner {hotkey} has no reported metrics...")
-                    continue
-                ratio = min([audit_count, reported_count]) / (
-                    max([audit_count, reported_count]) or 1.0
+            if os.getenv("CALCULATE_MINER_AGREEMENT", "false").lower() == "true":
+                logger.info("Calculating miner agreement ratio...")
+                metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
+                logger.info(
+                    "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
                 )
-                message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
-                if ratio < 0.9:
-                    logger.warning(message)
-                else:
-                    logger.success(message)
+                for row in metrics:
+                    hotkey, audit_count, reported_count = row
+                    if not audit_count or not reported_count:
+                        logger.warning(f"Miner {hotkey} has no reported metrics...")
+                        continue
+                    ratio = min([audit_count, reported_count]) / (
+                        max([audit_count, reported_count]) or 1.0
+                    )
+                    message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
+                    if ratio < 0.9:
+                        logger.warning(message)
+                    else:
+                        logger.success(message)
 
     async def _verify_integrity(self):
         """
@@ -2142,45 +2132,13 @@ class Auditor:
             )
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP WITHOUT TIME ZONE;
-            """)
-            )
-            await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS stop_billing_at TIMESTAMP WITHOUT TIME ZONE;
-            """)
-            )
-            await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS billed_to VARCHAR;
-            """)
-            )
-            await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
-            """)
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE audit_entries ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT true"
-                )
-            )
-            await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
                 )
             )
             await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_invocations_started ON invocations(started_at);"
-                )
+                text("CREATE INDEX IF NOT EXISTS idx_invocations_id ON invocations(invocation_id);")
             )
-            await conn.execute(text("DROP INDEX IF EXISTS idx_invocations_started_recent"))
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
