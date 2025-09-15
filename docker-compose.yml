@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: chutes_audit
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql/data
     restart: always
     shm_size: 4gb
     command:
@@ -57,6 +57,8 @@ services:
       - autovacuum_max_workers=4
       - -c
       - autovacuum_naptime=10s
+      - -c
+      - work_mem=256MB
   auditor:
     build:
       context: .
@@ -69,11 +71,17 @@ services:
       - hfhub:/root/.cache/huggingface
       - ./reports:/reports
     environment:
-      - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes_audit
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=chutes_audit
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - SKIP_MINER_AUDITS=${SKIP_MINER_AUDITS:-false}
+      - CALCULATE_MINER_AGREEMENT=${CALCULATE_MINER_AGREEMENT:-false}
     restart: always
     depends_on:
       - postgres
 
 volumes:
-  postgres_data:
+  pg_data:
   hfhub:

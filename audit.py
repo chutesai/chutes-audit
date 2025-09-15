@@ -4,6 +4,7 @@ import re
 import csv
 import ast
 import sys
+import time
 import uuid
 import glob
 import shutil
@@ -11,12 +12,14 @@ import random
 import aiohttp
 import yaml
 import tqdm
+import psutil
 import orjson as json
 import asyncio
 import tempfile
 import hashlib
 import backoff
 import traceback
+import subprocess
 from pathlib import Path
 import numpy as np
 import pybase64 as base64
@@ -28,6 +31,7 @@ from fiber.chain import weights
 from fiber.chain import fetch_nodes
 from fiber.networking.models import NodeWithFernet as Node
 from fiber.chain.chain_utils import query_substrate
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 from datetime import datetime, timedelta
 from langdetect import detect as detect_language
@@ -40,7 +44,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import (
     Column,
     String,
@@ -55,14 +58,21 @@ from sqlalchemy import (
     ForeignKey,
     text,
     Index,
+    or_,
 )
 from munch import munchify
 from datasets import load_dataset
 from contextlib import asynccontextmanager, contextmanager
 
 # Database configuration.
+POSTGRES_USER = os.getenv("POSTGRES_USER", "user")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", os.getenv("PGPASSWD", "password"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "chutes_audit")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+DB_STR = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/chutes_audit"
 engine = create_async_engine(
-    os.getenv("POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit"),
+    DB_STR,
     echo=False,
     pool_pre_ping=True,
     pool_reset_on_return="rollback",
@@ -83,18 +93,22 @@ FEATURE_WEIGHTS = {
     "bounty_count": 0.08,  # Number of bounties received (not bounty values, just counts).
 }
 MINER_METRICS_QUERY = """
-SELECT
-    mn.hotkey,
-    COUNT(*) as invocation_count,
-    COUNT(CASE WHEN i.bounty > 0 THEN 1 END) AS bounty_count,
+WITH excluded_reports AS (
+    SELECT invocation_id
+    FROM reports
+    WHERE confirmed_at IS NOT NULL
+) SELECT
+    i.miner_hotkey AS hotkey,
+    COUNT(CASE WHEN is_private is not true AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
+    COUNT(CASE WHEN i.bounty > 0 AND is_private is not true THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
+            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') OR is_private is true THEN 0::float
+
             -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
-            WHEN i.metrics->>'nc' IS NOT NULL
-                AND (i.metrics->>'nc')::float > 0
-            THEN (i.metrics->>'nc')::float
+            WHEN normalized_compute IS NOT NULL AND normalized_compute > 0 THEN normalized_compute
 
             -- For step-based computations
             WHEN i.metrics->>'steps' IS NOT NULL
@@ -102,7 +116,7 @@ SELECT
                 AND i.metrics->>'masps' IS NOT NULL
             THEN (i.metrics->>'steps')::float * (i.metrics->>'masps')::float
 
-            -- For token-based computations (it + ot)
+            -- Legacy token-based computations when 'nc' is not available.
             WHEN i.metrics->>'it' IS NOT NULL
                 AND i.metrics->>'ot' IS NOT NULL
                 AND (i.metrics->>'it')::float > 0
@@ -115,18 +129,8 @@ SELECT
         END
     ) AS compute_units
 FROM invocations i
-JOIN metagraph_nodes mn ON i.miner_hotkey = mn.hotkey AND mn.netuid = 64
-WHERE i.started_at > (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'
-    AND (i.error_message IS NULL or i.error_message = '')
-    AND i.miner_uid >= 0
-    AND i.completed_at IS NOT NULL
-    AND NOT EXISTS (
-        SELECT 1
-        FROM reports
-        WHERE invocation_id = i.parent_invocation_id
-        AND confirmed_at IS NOT NULL
-    )
-GROUP BY mn.hotkey;
+WHERE NOT EXISTS ( SELECT 1 FROM reports r WHERE r.confirmed_at IS NOT NULL AND r.invocation_id = i.parent_invocation_id )
+GROUP BY hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
 WITH time_series AS (
@@ -145,7 +149,6 @@ instances_with_success AS (
   WHERE
     error_message IS NULL
     AND completed_at IS NOT NULL
-    AND miner_uid >= 0
     AND NOT EXISTS (
         SELECT 1
         FROM reports
@@ -153,14 +156,10 @@ instances_with_success AS (
         AND confirmed_at IS NOT NULL
     )
 ),
--- Get all unique miner_hotkeys for valid miners in the specified subnet from metagraph_nodes
+-- Get all unique miner_hotkeys.
 all_miners AS (
   SELECT DISTINCT ia.miner_hotkey
   FROM instance_audits ia
-  -- Join with metagraph_nodes to filter for valid, registered miners
-  JOIN metagraph_nodes mn ON ia.miner_hotkey = mn.hotkey
-  WHERE mn.netuid = 64
-    AND mn.node_id >= 0
 ),
 -- Get the maximum GPU count ever recorded for each chute_id
 max_gpu_counts AS (
@@ -190,10 +189,6 @@ active_instances_per_timepoint AS (
         ELSE NULL
       END AS earliest_deleted_at
     FROM instance_audits ia_inner
-    -- Join with metagraph_nodes to filter for valid, registered miners
-    JOIN metagraph_nodes mn ON ia_inner.miner_hotkey = mn.hotkey
-    WHERE mn.netuid = 64
-      AND mn.node_id >= 0
     GROUP BY ia_inner.instance_id, ia_inner.chute_id, ia_inner.miner_hotkey
   ) ia ON
     ia.first_verified_at <= ts.time_point AND
@@ -264,7 +259,6 @@ FROM
     WHERE error_message is null
     AND miner_hotkey is not null
     AND completed_at is not null
-    AND miner_uid >= 0
     GROUP BY miner_hotkey) i
 FULL OUTER JOIN
    (SELECT hotkey, SUM(total_count) as metrics_count
@@ -341,25 +335,103 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-class Invocation(Base):
-    __tablename__ = "invocations"
-    parent_invocation_id = Column(String)
-    invocation_id = Column(String, primary_key=True)
-    chute_id = Column(String)
-    chute_user_id = Column(String)
-    function_name = Column(String)
-    user_id = Column(String)
-    image_id = Column(String)
-    image_user_id = Column(String)
-    instance_id = Column(String)
-    miner_uid = Column(Integer)
-    miner_hotkey = Column(String)
-    error_message = Column(String)
-    compute_multiplier = Column(Double)
-    bounty = Column(Integer)
-    metrics = Column(JSONB, nullable=True)
-    started_at = Column(DateTime(timezone=False))
-    completed_at = Column(DateTime(timezone=False), nullable=True)
+@lru_cache(maxsize=1)
+def get_optimal_worker_count(ram_per_worker_gb=4):
+    """
+    Calculate how many workers to use for invocation processing, which is
+    basically just free RAM based (ensure each worker has 4GB).
+    """
+    mem = psutil.virtual_memory()
+    available_gb = mem.available / (1024**3)
+    max_workers_by_ram = int(available_gb / ram_per_worker_gb)
+    cpu_count = psutil.cpu_count(logical=True)
+    optimal_workers = max(1, min(max_workers_by_ram, cpu_count))
+    logger.info(f"System RAM: {mem.total / (1024**3):.1f}GB total, {available_gb:.1f}GB available")
+    logger.info(f"CPU cores: {cpu_count}")
+    logger.info(f"Optimal workers: {optimal_workers} (based on {ram_per_worker_gb}GB per worker)")
+    return optimal_workers
+
+
+def escape_for_copy(val):
+    """
+    Helper function to escape values for COPY format.
+    """
+    if val is None:
+        return "\\N"
+    if isinstance(val, (dict, list)):
+        import orjson
+
+        val = orjson.dumps(val).decode()
+    else:
+        val = str(val)
+    return val.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def transform_invocation(row):
+    """
+    Transform a single invocation row.
+    """
+    row_data = dict(row)
+    row_data.update(
+        {
+            "miner_uid": int(row["miner_uid"]),
+            "compute_multiplier": float(row["compute_multiplier"]),
+            "bounty": int(row["bounty"]),
+            "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
+                tzinfo=None
+            ),
+        }
+    )
+    if row["completed_at"]:
+        row_data.update(
+            {
+                "completed_at": datetime.fromisoformat(row["completed_at"].rstrip("Z")).replace(
+                    tzinfo=None
+                )
+            }
+        )
+    else:
+        row_data["completed_at"] = None
+    for key in row_data:
+        if isinstance(row_data[key], str) and not row_data[key].strip():
+            row_data[key] = None
+    if row.get("metrics"):
+        try:
+            row_data["metrics"] = ast.literal_eval(row["metrics"])
+        except ValueError:
+            row_data["metrics"] = None
+    else:
+        row_data["metrics"] = None
+    return row_data
+
+
+def process_chunk(chunk):
+    """
+    Process a chunk of invocations.
+    """
+    return [transform_invocation(row) for row in chunk if int(row["miner_uid"]) >= 0]
+
+
+INVOCATION_COLS = [
+    "entry_id",
+    "parent_invocation_id",
+    "invocation_id",
+    "chute_id",
+    "chute_user_id",
+    "function_name",
+    "user_id",
+    "image_id",
+    "image_user_id",
+    "instance_id",
+    "miner_uid",
+    "miner_hotkey",
+    "error_message",
+    "compute_multiplier",
+    "bounty",
+    "metrics",
+    "started_at",
+    "completed_at",
+]
 
 
 class Report(Base):
@@ -443,6 +515,7 @@ class AuditEntry(Base):
     created_at = Column(DateTime(timezone=False))
     start_time = Column(DateTime(timezone=False))
     end_time = Column(DateTime(timezone=False))
+    processed = Column(Boolean, default=False)
 
 
 class Synthetic(Base):
@@ -1193,59 +1266,85 @@ class Auditor:
             )
         return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
-    async def load_invocations(self, session, csv_path):
+    async def load_invocations(self, csv_path: str, entry_id: str) -> int:
         """
-        Populate our local database with invocations from the CSV exports.
+        Load (after transform) invocations from CSV export into Postgres.
         """
-        logger.info(f"Inserting invocation records from {csv_path}")
-        total = 0
-        with open(csv_path, "r") as infile:
+        logger.info(f"Loading invocation records to transform and load into DB from {csv_path}")
+        with open(csv_path, "r", newline="") as infile:
             reader = csv.DictReader(infile)
-            batch = []
+            rows = []
             for row in reader:
-                row_data = dict(row)
-                row_data.update(
-                    {
-                        "miner_uid": int(row["miner_uid"]),
-                        "compute_multiplier": float(row["compute_multiplier"]),
-                        "bounty": int(row["bounty"]),
-                        "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
-                            tzinfo=None
-                        ),
-                    }
-                )
-                if row["completed_at"]:
-                    row_data.update(
-                        {
-                            "completed_at": datetime.fromisoformat(
-                                row["completed_at"].rstrip("Z")
-                            ).replace(tzinfo=None)
-                        }
+                row["entry_id"] = entry_id
+                rows.append(row)
+        if not rows:
+            logger.info("No rows to process")
+            return 0
+
+        logger.info(f"Read {len(rows)} rows from CSV, starting transformation...")
+        base_chunk_size = max(1, len(rows) // 100)
+        transform_chunks = [
+            rows[i : i + base_chunk_size] for i in range(0, len(rows), base_chunk_size)
+        ]
+        transformed_rows = []
+        with ProcessPoolExecutor(max_workers=get_optimal_worker_count()) as executor:
+            futures = [executor.submit(process_chunk, chunk) for chunk in transform_chunks]
+            for future in as_completed(futures):
+                try:
+                    transformed_rows.extend(future.result())
+                except Exception as e:
+                    logger.error(f"Chunk transformation failed: {e}")
+        if not transformed_rows:
+            logger.warning("No rows transformed")
+            return 0
+
+        logger.info(f"Transformation complete, {len(transformed_rows)} rows ready to load...")
+        timestamp = int(time.time() * 1000)
+        temp_csv_path = f"/tmp/invocations_load_{timestamp}.csv"
+        try:
+            with open(temp_csv_path, "w", newline="") as csvfile:
+                for row in transformed_rows:
+                    fields = [escape_for_copy(row.get(col)) for col in INVOCATION_COLS]
+                    csvfile.write("\t".join(fields) + "\n")
+            logger.info(f"Wrote {len(transformed_rows)} rows to temporary CSV: {temp_csv_path}")
+            part = f"inv_{entry_id.replace('-', '')}"
+            async with get_session() as session:
+                await session.execute(text(f"DROP TABLE IF EXISTS {part}"))
+                await session.execute(
+                    text(
+                        f"CREATE TABLE {part} PARTITION OF invocations FOR VALUES IN ('{entry_id}')"
                     )
-                else:
-                    row_data["completed_at"] = None
-                for key in row_data:
-                    if isinstance(row_data[key], str) and not row_data[key].strip():
-                        row_data[key] = None
-                if row.get("metrics"):
-                    try:
-                        row_data["metrics"] = ast.literal_eval(row["metrics"])
-                    except ValueError as exc:
-                        logger.warning(f"Error parsing metrics: {exc}: {row['metrics']}")
-                else:
-                    row_data["metrics"] = None
-                batch.append(row_data)
-                total += 1
-                if len(batch) == 100:
-                    bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
-                    await session.execute(bulk_insert)
-                    batch = []
-            if batch:
-                bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
-                await session.execute(bulk_insert)
-            await session.commit()
-        if total:
-            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+                )
+                await session.commit()
+            cmd = [
+                "psql",
+                "-h",
+                POSTGRES_HOST,
+                "-p",
+                str(POSTGRES_PORT),
+                "-U",
+                POSTGRES_USER,
+                "-d",
+                POSTGRES_DB,
+                "-c",
+                f"\\copy {part} ({','.join(INVOCATION_COLS)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
+            ]
+            logger.info("Running psql COPY command...")
+            env = os.environ.copy()
+            env["PGPASSWORD"] = POSTGRES_PASSWORD
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                logger.error(f"psql COPY failed: {result.stderr}")
+                raise Exception(f"psql COPY failed: {result.stderr}")
+            logger.info("Successfully copied data to invocations table!")
+            return len(transformed_rows)
+        except Exception as e:
+            logger.error(f"Failed to load invocations: {e}")
+            raise
+        finally:
+            if os.path.exists(temp_csv_path):
+                os.remove(temp_csv_path)
+                logger.debug(f"Cleaned up temporary CSV: {temp_csv_path}")
 
     async def load_reports(self, session, csv_path):
         """
@@ -1448,7 +1547,7 @@ class Auditor:
             # Get compute units/total/bounties.
             compute_result = await session.execute(query)
             for hotkey, invocation_count, bounty_count, compute_units in compute_result:
-                if hotkey is None:
+                if hotkey is None or hotkey not in hot_cold_map:
                     continue
                 raw_compute_values[hotkey] = {
                     "invocation_count": invocation_count,
@@ -1459,9 +1558,7 @@ class Auditor:
             unique_query = text(UNIQUE_CHUTE_AVERAGE_QUERY)
             unique_result = await session.execute(unique_query)
             for miner_hotkey, average_active_chutes in unique_result:
-                if miner_hotkey is None:
-                    continue
-                if miner_hotkey not in raw_compute_values:
+                if miner_hotkey is None or miner_hotkey not in raw_compute_values:
                     continue
                 raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
                 if average_active_chutes > highest_unique:
@@ -1649,18 +1746,20 @@ class Auditor:
         delete_directories = []
         async with get_session() as session:
             query = select(AuditEntry).where(
-                AuditEntry.created_at
-                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+                or_(
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=7),
+                    AuditEntry.processed.is_(False),
+                )
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
+                await session.execute(
+                    text(f"DROP TABLE IF EXISTS inv_{entry.entry_id.replace('-', '')}")
+                )
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
-            )
-            await session.execute(
-                text("DELETE FROM invocations WHERE started_at <= NOW() - INTERVAL '7 days 1 hour'")
             )
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
@@ -1677,6 +1776,10 @@ class Auditor:
             total += 1
             if record["hotkey"] in self.validators:
                 validator_total += 1
+            elif os.getenv("SKIP_MINER_AUDITS", "true").lower() == "true":
+                logger.info(f"Skipping miner audit data: {record['hotkey']}")
+                continue
+
             db_record = AuditEntry(
                 entry_id=record["entry_id"],
                 hotkey=record["hotkey"],
@@ -1691,6 +1794,7 @@ class Auditor:
                 end_time=datetime.fromisoformat(record["end_time"].rstrip("Z")).replace(
                     tzinfo=None
                 ),
+                processed=record["hotkey"] not in self.validators,
             )
             logger.info(
                 f"Need to verify new audit entry: {db_record.entry_id} "
@@ -1714,7 +1818,13 @@ class Auditor:
                 )
                 # Load CSV invocation data if it's from a validator.
                 if inv_csv_path:
-                    await self.load_invocations(session, inv_csv_path)
+                    if await self.load_invocations(inv_csv_path, db_record.entry_id):
+                        await session.execute(
+                            text(
+                                "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
+                            ),
+                            {"entry_id": db_record.entry_id},
+                        )
 
                 # Load reports CSV.
                 if reports_csv_path:
@@ -1819,23 +1929,25 @@ class Auditor:
                         )
 
             # Compare prometheus metrics first.
-            logger.info(
-                "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
-            )
-            metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
-            for row in metrics:
-                hotkey, audit_count, reported_count = row
-                if not audit_count or not reported_count:
-                    logger.warning(f"Miner {hotkey} has no reported metrics...")
-                    continue
-                ratio = min([audit_count, reported_count]) / (
-                    max([audit_count, reported_count]) or 1.0
+            if os.getenv("CALCULATE_MINER_AGREEMENT", "false").lower() == "true":
+                logger.info("Calculating miner agreement ratio...")
+                metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
+                logger.info(
+                    "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
                 )
-                message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
-                if ratio < 0.9:
-                    logger.warning(message)
-                else:
-                    logger.success(message)
+                for row in metrics:
+                    hotkey, audit_count, reported_count = row
+                    if not audit_count or not reported_count:
+                        logger.warning(f"Miner {hotkey} has no reported metrics...")
+                        continue
+                    ratio = min([audit_count, reported_count]) / (
+                        max([audit_count, reported_count]) or 1.0
+                    )
+                    message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
+                    if ratio < 0.9:
+                        logger.warning(message)
+                    else:
+                        logger.success(message)
 
     async def _verify_integrity(self):
         """
@@ -1970,44 +2082,67 @@ class Auditor:
         Main loop, to do all the things.
         """
         async with engine.begin() as conn:
+            await conn.execute(
+                text("""
+                DO $$
+                DECLARE
+                    is_partitioned BOOLEAN;
+                BEGIN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_class c
+                        WHERE c.relname = 'invocations'
+                        AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+                        AND c.relkind = 'r'
+                    ) INTO is_partitioned;
+                    IF is_partitioned THEN
+                        DROP TABLE invocations;
+                        RAISE NOTICE 'Dropped non-partitioned table invocations';
+                    ELSE
+                        RAISE NOTICE 'Table invocations does not exist or is partitioned, skipping drop';
+                    END IF;
+                END $$;
+                """)
+            )
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS invocations (
+                    entry_id text not null,
+                    parent_invocation_id character varying,
+                    invocation_id character varying NOT NULL,
+                    chute_id character varying,
+                    chute_user_id character varying,
+                    function_name character varying,
+                    user_id character varying,
+                    image_id character varying,
+                    image_user_id character varying,
+                    instance_id character varying,
+                    miner_uid integer,
+                    miner_hotkey character varying,
+                    error_message character varying,
+                    compute_multiplier double precision,
+                    bounty integer,
+                    metrics jsonb,
+                    started_at timestamp without time zone,
+                    completed_at timestamp without time zone,
+                    is_private boolean GENERATED ALWAYS AS ((metrics->>'p')::bool) STORED,
+                    normalized_compute double precision GENERATED ALWAYS AS ((metrics->>'nc')::float) STORED
+                ) PARTITION BY LIST(entry_id);
+                """)
+            )
             await conn.run_sync(Base.metadata.create_all)
-
             await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP WITHOUT TIME ZONE;
-            """)
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
+                )
             )
             await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS stop_billing_at TIMESTAMP WITHOUT TIME ZONE;
-            """)
+                text("CREATE INDEX IF NOT EXISTS idx_invocations_id ON invocations(invocation_id);")
             )
             await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS billed_to VARCHAR;
-            """)
-            )
-            await conn.execute(
-                text("""
-                ALTER TABLE instance_audits
-                ADD COLUMN IF NOT EXISTS compute_multiplier DOUBLE PRECISION;
-            """)
-            )
-            await conn.execute(
-                text("""
-                CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) WHERE confirmed_at IS NOT NULL;
-                """)
-            )
-            await conn.execute(
-                text("""
-                CREATE INDEX IF NOT EXISTS idx_invocations_started_recent ON invocations (started_at DESC)
-                WHERE completed_at IS NOT NULL
-                  AND (error_message IS NULL OR error_message = '')
-                  AND miner_uid >= 0;
-                """)
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
+                )
             )
 
         tasks = []
