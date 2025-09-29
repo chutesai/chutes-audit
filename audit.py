@@ -134,111 +134,71 @@ GROUP BY hotkey;
 """
 UNIQUE_CHUTE_AVERAGE_QUERY = """
 WITH time_series AS (
-  SELECT
-    generate_series(
-      date_trunc('hour', now() - INTERVAL '7 days'),
-      date_trunc('hour', now()),
-      INTERVAL '1 hour'
-    ) AS time_point
+  SELECT generate_series(
+    date_trunc('hour', now() - INTERVAL '7 days'),
+    date_trunc('hour', now()),
+    INTERVAL '1 hour'
+  ) AS time_point
 ),
--- Get all instances that had at least one successful invocation (ever) while the instance was alive.
-instances_with_success AS (
-  SELECT DISTINCT
-    instance_id
-  FROM invocations ii
-  WHERE
-    error_message IS NULL
-    AND completed_at IS NOT NULL
-    AND NOT EXISTS (
-        SELECT 1
-        FROM reports
-        WHERE invocation_id = ii.parent_invocation_id
-        AND confirmed_at IS NOT NULL
-    )
-),
--- Get all unique miner_hotkeys.
-all_miners AS (
-  SELECT DISTINCT ia.miner_hotkey
-  FROM instance_audits ia
-),
--- Get the maximum GPU count ever recorded for each chute_id
-max_gpu_counts AS (
-  SELECT
+-- Get the latest gpu_count per chute (most recent entry only)
+latest_chute_config AS (
+  SELECT DISTINCT ON (chute_id)
     chute_id,
-    MAX(gpu_count) AS gpu_count
+    gpu_count
   FROM gpu_counts
-  GROUP BY chute_id
 ),
--- For each time point, find active instances (belonging to valid miners) that have had successful invocations
-active_instances_per_timepoint AS (
+-- Dedupe instance_audits to get the lifecycle of each instance
+deduped_instances AS (
   SELECT
+    instance_id,
+    chute_id,
+    miner_hotkey,
+    MIN(activated_at) AS first_activated_at,
+    MAX(deleted_at) AS last_deleted_at,
+    MAX(billed_to) AS any_billed_to
+  FROM instance_audits
+  GROUP BY instance_id, chute_id, miner_hotkey
+),
+active_chutes AS (
+  SELECT DISTINCT ON (ts.time_point, di.chute_id, di.miner_hotkey)
     ts.time_point,
-    ia.instance_id,
-    ia.chute_id,
-    ia.miner_hotkey
+    di.chute_id,
+    di.miner_hotkey
   FROM time_series ts
-  JOIN (
-    SELECT
-      ia_inner.instance_id,
-      ia_inner.chute_id,
-      ia_inner.miner_hotkey,
-      MIN(ia_inner.verified_at) AS first_verified_at,
-      CASE
-        WHEN COUNT(CASE WHEN ia_inner.deleted_at IS NOT NULL THEN 1 END) > 0 THEN
-          MIN(ia_inner.deleted_at)
-        ELSE NULL
-      END AS earliest_deleted_at
-    FROM instance_audits ia_inner
-    GROUP BY ia_inner.instance_id, ia_inner.chute_id, ia_inner.miner_hotkey
-  ) ia ON
-    ia.first_verified_at <= ts.time_point AND
-    (ia.earliest_deleted_at IS NULL OR ia.earliest_deleted_at >= ts.time_point)
-  -- Ensure the instance had at least one successful invocation
-  JOIN instances_with_success iws ON
-    ia.instance_id = iws.instance_id
+  JOIN deduped_instances di
+    ON di.first_activated_at <= ts.time_point
+   AND (di.last_deleted_at IS NULL OR di.last_deleted_at >= ts.time_point)
+   AND di.first_activated_at IS NOT NULL
+   AND (
+        di.any_billed_to IS NOT NULL
+        OR (COALESCE(di.last_deleted_at, ts.time_point) - di.first_activated_at >= interval '1 hour')
+   )
 ),
--- Calculate GPU-weighted chute count per miner per time point
-active_chutes_per_timepoint AS (
+-- Get GPU-weighted chutes for each hotkey at each time point
+gpu_weighted_data AS (
   SELECT
-    aipt.time_point,
-    aipt.miner_hotkey,
-    SUM(COALESCE(mgc.gpu_count, 1)) AS gpu_weighted_chutes
-  FROM (
-    SELECT DISTINCT
-      time_point,
-      miner_hotkey,
-      chute_id
-    FROM active_instances_per_timepoint
-  ) aipt
-  -- Left join with the maximum GPU counts for each chute
-  LEFT JOIN max_gpu_counts mgc ON
-    aipt.chute_id = mgc.chute_id
-  GROUP BY aipt.time_point, aipt.miner_hotkey
+    ac.miner_hotkey,
+    ac.time_point,
+    ac.chute_id,
+    COALESCE(lcc.gpu_count, 1)::int AS gpu_weighted_chutes
+  FROM active_chutes ac
+  LEFT JOIN latest_chute_config lcc
+    ON ac.chute_id = lcc.chute_id
 ),
--- Create a cross join of all time points with all *valid* miners
-all_timepoints_for_all_miners AS (
+-- Sum GPU-weighted chutes per hotkey per time point
+summed_per_timepoint AS (
   SELECT
-    ts.time_point,
-    am.miner_hotkey
-  FROM time_series ts
-  CROSS JOIN all_miners am
-),
--- Join with active_chutes to get complete dataset with zeros
-complete_dataset AS (
-  SELECT
-    atm.miner_hotkey,
-    atm.time_point,
-    COALESCE(acpt.gpu_weighted_chutes, 0) AS gpu_weighted_chutes
-  FROM all_timepoints_for_all_miners atm
-  LEFT JOIN active_chutes_per_timepoint acpt ON
-    atm.time_point = acpt.time_point AND
-    atm.miner_hotkey = acpt.miner_hotkey
+    miner_hotkey,
+    time_point,
+    SUM(gpu_weighted_chutes) AS total_gpu_weighted_chutes
+  FROM gpu_weighted_data
+  GROUP BY miner_hotkey, time_point
 )
--- Calculate average GPU-weighted chutes per miner across all time points
+-- Calculate average across all time points per hotkey
 SELECT
   miner_hotkey,
-  AVG(gpu_weighted_chutes)::integer AS avg_gpu_weighted_chutes
-FROM complete_dataset
+  AVG(total_gpu_weighted_chutes) AS gpu_weighted_chutes
+FROM summed_per_timepoint
 GROUP BY miner_hotkey;
 """
 MISSING_INVOCATIONS_QUERY = """
@@ -282,6 +242,7 @@ WITH deduplicated_instance_audit AS (
     FROM instance_audits
     WHERE billed_to IS NOT NULL
       AND activated_at IS NOT NULL
+      AND deletion_reason != 'miner initialized'
     GROUP BY instance_id
 ),
 billed_instances AS (
@@ -1560,9 +1521,9 @@ class Auditor:
             for miner_hotkey, average_active_chutes in unique_result:
                 if miner_hotkey is None or miner_hotkey not in raw_compute_values:
                     continue
-                raw_compute_values[miner_hotkey]["unique_chute_count"] = average_active_chutes
+                raw_compute_values[miner_hotkey]["unique_chute_count"] = int(average_active_chutes)
                 if average_active_chutes > highest_unique:
-                    highest_unique = average_active_chutes
+                    highest_unique = int(average_active_chutes)
 
             # Private instances.
             private_result = await session.execute(text(PRIVATE_INSTANCES_QUERY))
