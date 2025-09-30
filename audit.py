@@ -99,13 +99,13 @@ WITH excluded_reports AS (
     WHERE confirmed_at IS NOT NULL
 ) SELECT
     i.miner_hotkey AS hotkey,
-    COUNT(CASE WHEN is_private is not true AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
-    COUNT(CASE WHEN i.bounty > 0 AND is_private is not true THEN 1 END) AS bounty_count,
+    COUNT(CASE WHEN (is_private is not true OR chute_id = '561e4875-254d-588f-a36f-57c9cdef8961') AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
+    COUNT(CASE WHEN i.bounty > 0 AND (is_private is not true or chute_id = '561e4875-254d-588f-a36f-57c9cdef8961') THEN 1 END) AS bounty_count,
     sum(
         i.bounty +
         i.compute_multiplier *
         CASE
-            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') OR is_private is true THEN 0::float
+            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') OR (is_private is true AND chute_id != '561e4875-254d-588f-a36f-57c9cdef8961') THEN 0::float
 
             -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
             WHEN normalized_compute IS NOT NULL AND normalized_compute > 0 THEN normalized_compute
