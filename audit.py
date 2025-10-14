@@ -242,7 +242,11 @@ WITH deduplicated_instance_audit AS (
     FROM instance_audits
     WHERE billed_to IS NOT NULL
       AND activated_at IS NOT NULL
-      AND deletion_reason != 'miner initialized'
+      AND (deletion_reason in (
+        'job has been terminated due to insufficient user balance',
+        'user-defined/private chute instance has not been used since shutdown_after_seconds',
+        'user has zero/negative balance (private chute)'
+      ) or deletion_reason like '%has an old version%')
     GROUP BY instance_id
 ),
 billed_instances AS (
