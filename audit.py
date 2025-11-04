@@ -232,22 +232,31 @@ EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 PRIVATE_INSTANCES_QUERY = """
 WITH deduplicated_instance_audit AS (
     SELECT
-        instance_id,
-        (array_agg(miner_hotkey ORDER BY verified_at DESC NULLS LAST))[1] as miner_hotkey,
-        (array_agg(billed_to ORDER BY verified_at DESC NULLS LAST))[1] as billed_to,
-        (array_agg(compute_multiplier ORDER BY verified_at DESC NULLS LAST))[1] as compute_multiplier,
-        MIN(activated_at) as activated_at,
-        MAX(stop_billing_at) as stop_billing_at,
-        MAX(deleted_at) as deleted_at
-    FROM instance_audits
-    WHERE billed_to IS NOT NULL
-      AND activated_at IS NOT NULL
-      AND (deletion_reason in (
-        'job has been terminated due to insufficient user balance',
-        'user-defined/private chute instance has not been used since shutdown_after_seconds',
-        'user has zero/negative balance (private chute)'
-      ) or deletion_reason like '%has an old version%')
-    GROUP BY instance_id
+        ia.instance_id,
+        (array_agg(ia.miner_hotkey      ORDER BY ia.verified_at DESC NULLS LAST))[1] AS miner_hotkey,
+        (array_agg(ia.billed_to         ORDER BY ia.verified_at DESC NULLS LAST))[1] AS billed_to,
+        (array_agg(ia.compute_multiplier ORDER BY ia.verified_at DESC NULLS LAST))[1] AS compute_multiplier,
+        MIN(ia.activated_at)      AS activated_at,
+        MAX(ia.stop_billing_at)   AS stop_billing_at,
+        MAX(ia.deleted_at)        AS deleted_at
+    FROM instance_audits ia
+    WHERE ia.billed_to IS NOT NULL
+      AND ia.activated_at IS NOT NULL
+      AND (
+            ia.deletion_reason IN (
+              'job has been terminated due to insufficient user balance',
+              'user-defined/private chute instance has not been used since shutdown_after_seconds',
+              'user has zero/negative balance (private chute)'
+            )
+         OR ia.deletion_reason LIKE '%has an old version%'
+         OR NOT EXISTS (
+                SELECT 1
+                FROM instance_audits ia2
+                WHERE ia2.instance_id = ia.instance_id
+                  AND ia2.deleted_at IS NOT NULL
+            )
+      )
+    GROUP BY ia.instance_id
 ),
 billed_instances AS (
     SELECT
@@ -256,21 +265,21 @@ billed_instances AS (
         ia.activated_at,
         ia.stop_billing_at,
         ia.compute_multiplier,
-        GREATEST(ia.activated_at, now() - interval '7 days') as billing_start,
+        GREATEST(ia.activated_at, now() - interval '7 days') AS billing_start,
         LEAST(
             COALESCE(ia.stop_billing_at, now()),
-            COALESCE(ia.deleted_at, now()),
+            COALESCE(ia.deleted_at,     now()),
             now()
-        ) as billing_end
+        ) AS billing_end
     FROM deduplicated_instance_audit ia
     WHERE (ia.stop_billing_at IS NULL OR ia.stop_billing_at >= now() - interval '7 days')
 ),
 miner_compute_units AS (
     SELECT
         miner_hotkey,
-        COUNT(*) as total_instances,
-        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start))) as compute_seconds,
-        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)) * compute_multiplier) as compute_units
+        COUNT(*) AS total_instances,
+        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)))                         AS compute_seconds,
+        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)) * compute_multiplier)    AS compute_units
     FROM billed_instances
     WHERE billing_end > billing_start
     GROUP BY miner_hotkey
@@ -278,8 +287,8 @@ miner_compute_units AS (
 SELECT
     miner_hotkey,
     total_instances,
-    COALESCE(compute_seconds, 0) as compute_seconds,
-    COALESCE(compute_units, 0) as compute_units
+    COALESCE(compute_seconds, 0) AS compute_seconds,
+    COALESCE(compute_units,  0) AS compute_units
 FROM miner_compute_units;
 """
 
