@@ -96,18 +96,18 @@ SELECT
     earliest.validator,
     earliest.chute_id,
     earliest.version,
-    COALESCE(latest_state.miner_hotkey, earliest.miner_hotkey) AS miner_hotkey,
+    earliest.miner_hotkey AS miner_hotkey,
     earliest.region,
     earliest.created_at,
     earliest.verified_at,
-    COALESCE(activation_info.activated_at, earliest.activated_at) AS activated_at,
-    COALESCE(latest_state.compute_multiplier, earliest.compute_multiplier) AS compute_multiplier,
+    activation_info.activated_at,
+    earliest.compute_multiplier,
     COALESCE(bounty_info.bounty, FALSE) AS bounty,
     deletion_info.valid_termination,
     deletion_info.deleted_at,
     deletion_info.deletion_reason,
     deletion_info.stop_billing_at,
-    COALESCE(latest_state.billed_to, deletion_info.billed_to) AS billed_to
+    deletion_info.billed_to AS billed_to
 
 FROM (SELECT DISTINCT instance_id FROM instance_audits) i
 
@@ -127,28 +127,6 @@ LEFT JOIN LATERAL (
     ORDER BY ia.activated_at
     LIMIT 1
 ) activation_info ON true
-
-LEFT JOIN LATERAL (
-    SELECT
-      (SELECT ia.miner_hotkey
-         FROM instance_audits ia
-        WHERE ia.instance_id = i.instance_id
-          AND ia.miner_hotkey IS NOT NULL
-        ORDER BY ia.verified_at DESC NULLS LAST, ia.created_at DESC
-        LIMIT 1) AS miner_hotkey,
-      (SELECT ia.compute_multiplier
-         FROM instance_audits ia
-        WHERE ia.instance_id = i.instance_id
-          AND ia.compute_multiplier IS NOT NULL
-        ORDER BY ia.verified_at DESC NULLS LAST, ia.created_at DESC
-        LIMIT 1) AS compute_multiplier,
-      (SELECT ia.billed_to
-         FROM instance_audits ia
-        WHERE ia.instance_id = i.instance_id
-          AND ia.billed_to IS NOT NULL
-        ORDER BY ia.verified_at DESC NULLS LAST, ia.created_at DESC
-        LIMIT 1) AS billed_to
-) latest_state ON true
 
 LEFT JOIN LATERAL (
   SELECT BOOL_OR(COALESCE(ia.bounty, FALSE)) AS bounty
@@ -2289,7 +2267,7 @@ class Auditor:
                   AND column_name = 'bounty'
               ) THEN
                 ALTER TABLE instance_audits
-                ADD COLUMN bounty boolean NOT NULL DEFAULT false;
+                ADD COLUMN bounty boolean DEFAULT false;
 
                 UPDATE instance_audits ia
                 SET bounty = true
