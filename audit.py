@@ -735,6 +735,86 @@ class Auditor:
                 )
             await session.commit()
 
+    async def reconcile_instance_audit_deletions(self, conn):
+        """
+        Backfill missing deleted_at values in instance_audits from the authoritative CSV feed.
+        """
+        url = "https://api.chutes.ai/instances/reconciliation_csv"
+        try:
+            async with self.aiosession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"Unable to fetch reconciliation csv ({resp.status}), skipping deleted_at backfill"
+                        )
+                        return
+                    payload = await resp.text()
+        except Exception as exc:
+            logger.error(f"Failed to download reconciliation csv: {exc}")
+            return
+
+        csv_io = io.StringIO(payload)
+        reader = csv.DictReader(csv_io)
+        rows = []
+        for row in reader:
+            instance_id = (row.get("instance_id") or row.get("instanceId") or "").strip()
+            deleted_at = (row.get("deleted_at") or row.get("deletedAt") or "").strip()
+            if not instance_id or not deleted_at:
+                continue
+            rows.append({"instance_id": instance_id, "deleted_at": deleted_at})
+
+        if not rows:
+            logger.info("Reconciliation csv is empty, no instance deletions to backfill")
+            return
+
+        await conn.execute(
+            text(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS tmp_instance_deletions (
+                    instance_id text PRIMARY KEY,
+                    deleted_at timestamp without time zone
+                ) ON COMMIT DROP
+                """
+            )
+        )
+
+        await conn.execute(
+            text(
+                "INSERT INTO tmp_instance_deletions (instance_id, deleted_at) VALUES (:instance_id, :deleted_at)"
+            ),
+            rows,
+        )
+
+        update_result = await conn.execute(
+            text(
+                """
+                UPDATE instance_audits ia
+                SET deleted_at = tmp.deleted_at
+                FROM tmp_instance_deletions tmp
+                WHERE ia.instance_id = tmp.instance_id
+                  AND ia.deleted_at IS NULL
+                  AND tmp.deleted_at IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM instance_audits ia_existing
+                    WHERE ia_existing.instance_id = ia.instance_id
+                      AND ia_existing.deleted_at IS NOT NULL
+                  )
+                """
+            )
+        )
+        updated_rows = update_result.rowcount if update_result.rowcount else 0
+        if updated_rows < 0:
+            updated_rows = 0
+        logger.info(f"Reconciled deleted_at for {updated_rows} instance_audits records from CSV")
+
+    async def reconcile_instance_audit(self):
+        """
+        Standalone entrypoint for reconciling instance_audit deletions.
+        """
+        async with engine.begin() as conn:
+            await self.reconcile_instance_audit_deletions(conn)
+
     def get_random_image_payload(self, model: str):
         """
         Get a random request payload for diffusion chutes.
@@ -2325,6 +2405,8 @@ async def main():
     fix_reports_path()
     if "--recover" in sys.argv:
         await auditor.recover_instance_audits()
+    elif "--reconcile" in sys.argv:
+        await auditor.reconcile_instance_audit()
     else:
         await auditor.run()
 
