@@ -151,14 +151,9 @@ LEFT JOIN LATERAL (
 ) latest_state ON true
 
 LEFT JOIN LATERAL (
-    SELECT BOOL_OR(ia.bounty IS TRUE) AS bounty
-    FROM instance_audits ia
-    WHERE ia.instance_id = i.instance_id
-      AND ia.source = 'validator'
-      AND (
-            ia.miner_hotkey = '5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ'
-         OR ia.validator    = '5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ'
-      )
+  SELECT BOOL_OR(COALESCE(ia.bounty, FALSE)) AS bounty
+  FROM instance_audits ia
+  WHERE ia.instance_id = i.instance_id
 ) bounty_info ON true
 
 LEFT JOIN LATERAL (
