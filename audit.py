@@ -755,58 +755,109 @@ class Auditor:
 
         csv_io = io.StringIO(payload)
         reader = csv.DictReader(csv_io)
-        rows = []
-        for row in reader:
-            instance_id = (row.get("instance_id") or row.get("instanceId") or "").strip()
-            deleted_at = (row.get("deleted_at") or row.get("deletedAt") or "").strip()
-            if not instance_id or not deleted_at:
-                continue
-            rows.append({"instance_id": instance_id, "deleted_at": deleted_at})
+        rows_written = 0
+        tmp_csv_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w+", delete=False, newline="") as tmp_csv:
+                tmp_csv_path = tmp_csv.name
+                writer = csv.writer(tmp_csv)
+                writer.writerow(["instance_id", "deleted_at"])
+                for row in reader:
+                    instance_id = (row.get("instance_id") or row.get("instanceId") or "").strip()
+                    deleted_at = (row.get("deleted_at") or row.get("deletedAt") or "").strip()
+                    if not instance_id or not deleted_at:
+                        continue
+                    writer.writerow([instance_id, deleted_at])
+                    rows_written += 1
+        except Exception as exc:
+            if tmp_csv_path:
+                Path(tmp_csv_path).unlink(missing_ok=True)
+            logger.error(f"Failed to create temp csv for reconciliation: {exc}")
+            return
 
-        if not rows:
+        if rows_written == 0 or not tmp_csv_path:
+            if tmp_csv_path:
+                Path(tmp_csv_path).unlink(missing_ok=True)
             logger.info("Reconciliation csv is empty, no instance deletions to backfill")
             return
 
-        await conn.execute(
-            text(
-                """
-                CREATE TEMP TABLE IF NOT EXISTS tmp_instance_deletions (
-                    instance_id text PRIMARY KEY,
-                    deleted_at timestamp without time zone
-                ) ON COMMIT DROP
-                """
-            )
-        )
+        escaped_path = tmp_csv_path.replace("'", "''")
+        sql_script = f"""
+\\set csv_path '{escaped_path}'
+BEGIN;
+DROP TABLE IF EXISTS tmp_instance_deletions;
+CREATE TEMP TABLE tmp_instance_deletions (
+    instance_id text PRIMARY KEY,
+    deleted_at timestamp without time zone
+);
+\\copy tmp_instance_deletions (instance_id, deleted_at) FROM :'csv_path' WITH (FORMAT csv, HEADER true);
+UPDATE instance_audits ia
+SET deleted_at = tmp.deleted_at
+FROM tmp_instance_deletions tmp
+WHERE ia.instance_id = tmp.instance_id
+  AND ia.deleted_at IS NULL
+  AND tmp.deleted_at IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM instance_audits ia_existing
+    WHERE ia_existing.instance_id = ia.instance_id
+      AND ia_existing.deleted_at IS NOT NULL
+  );
+DROP TABLE IF EXISTS tmp_instance_deletions;
+COMMIT;
+"""
 
-        await conn.execute(
-            text(
-                "INSERT INTO tmp_instance_deletions (instance_id, deleted_at) VALUES (:instance_id, :deleted_at)"
-            ),
-            rows,
+        env = os.environ.copy()
+        env.update(
+            {
+                "PGUSER": POSTGRES_USER,
+                "PGPASSWORD": POSTGRES_PASSWORD,
+                "PGHOST": POSTGRES_HOST,
+                "PGPORT": str(POSTGRES_PORT),
+                "PGDATABASE": POSTGRES_DB,
+            }
         )
+        cmd = [
+            "psql",
+            "--no-psqlrc",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "--dbname",
+            POSTGRES_DB,
+        ]
 
-        update_result = await conn.execute(
-            text(
-                """
-                UPDATE instance_audits ia
-                SET deleted_at = tmp.deleted_at
-                FROM tmp_instance_deletions tmp
-                WHERE ia.instance_id = tmp.instance_id
-                  AND ia.deleted_at IS NULL
-                  AND tmp.deleted_at IS NOT NULL
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM instance_audits ia_existing
-                    WHERE ia_existing.instance_id = ia.instance_id
-                      AND ia_existing.deleted_at IS NOT NULL
-                  )
-                """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
+            stdout, stderr = await process.communicate(sql_script.encode("utf-8"))
+        except FileNotFoundError:
+            logger.error("psql command not found; ensure PostgreSQL client tools are installed.")
+            Path(tmp_csv_path).unlink(missing_ok=True)
+            return
+
+        Path(tmp_csv_path).unlink(missing_ok=True)
+
+        if process.returncode != 0:
+            logger.error(
+                f"psql reconcile failed (exit {process.returncode}): {stderr.decode().strip()}"
+            )
+            return
+
+        stdout_text = stdout.decode().strip()
+        updated_rows = 0
+        for line in reversed(stdout_text.splitlines()):
+            match = re.search(r"UPDATE (\\d+)", line)
+            if match:
+                updated_rows = int(match.group(1))
+                break
+        logger.info(
+            f"Reconciled deleted_at for {updated_rows} instance_audits records via psql bulk import"
         )
-        updated_rows = update_result.rowcount if update_result.rowcount else 0
-        if updated_rows < 0:
-            updated_rows = 0
-        logger.info(f"Reconciled deleted_at for {updated_rows} instance_audits records from CSV")
 
     async def reconcile_instance_audit(self):
         """
