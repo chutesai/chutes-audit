@@ -88,65 +88,35 @@ Base = declarative_base()
 INSTANCE_AUDIT_VIEW = """
 CREATE OR REPLACE VIEW instance_audit AS
 SELECT
-    i.instance_id,
-    earliest.audit_id,
-    earliest.entry_id,
-    earliest.source,
-    earliest.deployment_id,
-    earliest.validator,
-    earliest.chute_id,
-    earliest.version,
-    earliest.miner_hotkey AS miner_hotkey,
-    earliest.region,
-    earliest.created_at,
-    earliest.verified_at,
-    activation_info.activated_at,
-    earliest.compute_multiplier,
-    COALESCE(bounty_info.bounty, FALSE) AS bounty,
-    deletion_info.valid_termination,
-    deletion_info.deleted_at,
-    deletion_info.deletion_reason,
-    deletion_info.stop_billing_at,
-    deletion_info.billed_to AS billed_to
-
-FROM (SELECT DISTINCT instance_id FROM instance_audits) i
-
-INNER JOIN LATERAL (
-    SELECT *
-    FROM instance_audits ia
-    WHERE ia.instance_id = i.instance_id
-    ORDER BY ia.created_at
-    LIMIT 1
-) earliest ON true
-
-LEFT JOIN LATERAL (
-    SELECT ia.activated_at
-    FROM instance_audits ia
-    WHERE ia.instance_id = i.instance_id
-      AND ia.activated_at IS NOT NULL
-    ORDER BY ia.activated_at
-    LIMIT 1
-) activation_info ON true
-
-LEFT JOIN LATERAL (
-  SELECT BOOL_OR(COALESCE(ia.bounty, FALSE)) AS bounty
+  i.instance_id,
+  latest.audit_id,
+  latest.entry_id,
+  latest.source,
+  latest.deployment_id,
+  latest.validator,
+  latest.chute_id,
+  latest.version,
+  latest.miner_uid,
+  latest.miner_hotkey,
+  latest.region,
+  latest.created_at,
+  latest.verified_at,
+  latest.activated_at,
+  latest.compute_multiplier,
+  latest.bounty,
+  latest.valid_termination,
+  latest.deleted_at,
+  latest.deletion_reason,
+  latest.stop_billing_at,
+  latest.billed_to
+FROM (SELECT DISTINCT instance_id FROM instance_audits) AS i
+JOIN LATERAL (
+  SELECT *
   FROM instance_audits ia
-  WHERE ia.instance_id = i.instance_id
-) bounty_info ON true
-
-LEFT JOIN LATERAL (
-    SELECT
-        ia.valid_termination,
-        ia.deleted_at,
-        ia.deletion_reason,
-        ia.stop_billing_at,
-        ia.billed_to
-    FROM instance_audits ia
-    WHERE ia.instance_id = i.instance_id
-      AND ia.deleted_at IS NOT NULL
-    ORDER BY ia.deleted_at DESC
-    LIMIT 1
-) deletion_info ON true;
+  WHERE ia.instance_id = i.instance_id and source = 'validator'
+  ORDER BY ia.deleted_at DESC NULLS LAST, ia.verified_at DESC NULLS LAST, ia.created_at DESC
+  LIMIT 1
+) AS latest ON TRUE;
 """
 
 # Query and score weighting values to use for calculating incentive/setting weights.
@@ -740,7 +710,7 @@ class Auditor:
         Backfill missing deleted_at values in instance_audits from the authoritative CSV feed.
         """
         url = "https://api.chutes.ai/instances/reconciliation_csv"
-        try:
+        with open("reconciliation_data.csv", "w") as outfile:
             async with self.aiosession() as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
@@ -748,49 +718,16 @@ class Auditor:
                             f"Unable to fetch reconciliation csv ({resp.status}), skipping deleted_at backfill"
                         )
                         return
-                    payload = await resp.text()
-        except Exception as exc:
-            logger.error(f"Failed to download reconciliation csv: {exc}")
-            return
+                    outfile.write(await resp.text())
 
-        csv_io = io.StringIO(payload)
-        reader = csv.DictReader(csv_io)
-        rows_written = 0
-        tmp_csv_path = None
-        try:
-            with tempfile.NamedTemporaryFile("w+", delete=False, newline="") as tmp_csv:
-                tmp_csv_path = tmp_csv.name
-                writer = csv.writer(tmp_csv)
-                writer.writerow(["instance_id", "deleted_at"])
-                for row in reader:
-                    instance_id = (row.get("instance_id") or row.get("instanceId") or "").strip()
-                    deleted_at = (row.get("deleted_at") or row.get("deletedAt") or "").strip()
-                    if not instance_id or not deleted_at:
-                        continue
-                    writer.writerow([instance_id, deleted_at])
-                    rows_written += 1
-        except Exception as exc:
-            if tmp_csv_path:
-                Path(tmp_csv_path).unlink(missing_ok=True)
-            logger.error(f"Failed to create temp csv for reconciliation: {exc}")
-            return
-
-        if rows_written == 0 or not tmp_csv_path:
-            if tmp_csv_path:
-                Path(tmp_csv_path).unlink(missing_ok=True)
-            logger.info("Reconciliation csv is empty, no instance deletions to backfill")
-            return
-
-        escaped_path = tmp_csv_path.replace("'", "''")
         sql_script = f"""
-\\set csv_path '{escaped_path}'
 BEGIN;
-DROP TABLE IF EXISTS tmp_instance_deletions;
-CREATE TEMP TABLE tmp_instance_deletions (
+CREATE TABLE IF NOT EXISTS tmp_instance_deletions (
     instance_id text PRIMARY KEY,
     deleted_at timestamp without time zone
 );
-\\copy tmp_instance_deletions (instance_id, deleted_at) FROM :'csv_path' WITH (FORMAT csv, HEADER true);
+TRUNCATE tmp_instance_deletions;
+\\copy tmp_instance_deletions (instance_id, deleted_at) FROM 'reconciliation_data.csv' WITH (FORMAT csv, HEADER true);
 UPDATE instance_audits ia
 SET deleted_at = tmp.deleted_at
 FROM tmp_instance_deletions tmp
@@ -803,7 +740,6 @@ WHERE ia.instance_id = tmp.instance_id
     WHERE ia_existing.instance_id = ia.instance_id
       AND ia_existing.deleted_at IS NOT NULL
   );
-DROP TABLE IF EXISTS tmp_instance_deletions;
 COMMIT;
 """
 
@@ -840,7 +776,7 @@ COMMIT;
             Path(tmp_csv_path).unlink(missing_ok=True)
             return
 
-        Path(tmp_csv_path).unlink(missing_ok=True)
+        Path('reconciliation_data.csv').unlink(missing_ok=True)
 
         if process.returncode != 0:
             logger.error(
