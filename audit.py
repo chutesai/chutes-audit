@@ -2391,7 +2391,7 @@ COMMIT;
 
             await conn.execute(
                 text("""
-                ALTER TABLE instance_audits ADD COLUMN IF NOT EXISTS valid_termination boolean NOT NULL DEFAULT false
+                ALTER TABLE instance_audits ADD COLUMN IF NOT EXISTS valid_termination boolean DEFAULT false
             """)
             )
             await conn.execute(
