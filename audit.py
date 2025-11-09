@@ -84,29 +84,56 @@ SessionLocal = sessionmaker(
 )
 Base = declarative_base()
 
+# Unified instance audit view.
+INSTANCE_AUDIT_VIEW = """
+CREATE OR REPLACE VIEW instance_audit AS
+SELECT
+  i.instance_id,
+  latest.audit_id,
+  latest.entry_id,
+  latest.source,
+  latest.deployment_id,
+  latest.validator,
+  latest.chute_id,
+  latest.version,
+  latest.miner_uid,
+  latest.miner_hotkey,
+  latest.region,
+  latest.created_at,
+  latest.verified_at,
+  latest.activated_at,
+  latest.compute_multiplier,
+  latest.bounty,
+  latest.valid_termination,
+  latest.deleted_at,
+  latest.deletion_reason,
+  latest.stop_billing_at,
+  latest.billed_to
+FROM (SELECT DISTINCT instance_id FROM instance_audits) AS i
+JOIN LATERAL (
+  SELECT *
+  FROM instance_audits ia
+  WHERE ia.instance_id = i.instance_id and source = 'validator'
+  ORDER BY ia.deleted_at DESC NULLS LAST, ia.verified_at DESC NULLS LAST, ia.created_at DESC
+  LIMIT 1
+) AS latest ON TRUE;
+"""
+
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
-FEATURE_WEIGHTS = {
-    "compute_units": 0.52,  # Total amount of compute time (compute multiplier * total time).
-    "invocation_count": 0.20,  # Total number of invocations.
-    "unique_chute_count": 0.20,  # Number of unique chutes over the scoring period.
-    "bounty_count": 0.08,  # Number of bounties received (not bounty values, just counts).
-}
-MINER_METRICS_QUERY = """
+
+# Invocation metrics.
+NORMALIZED_COMPUTE_QUERY = """
 WITH excluded_reports AS (
     SELECT invocation_id
     FROM reports
     WHERE confirmed_at IS NOT NULL
 ) SELECT
     i.miner_hotkey AS hotkey,
-    COUNT(CASE WHEN (is_private is not true OR chute_id = '561e4875-254d-588f-a36f-57c9cdef8961') AND i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as invocation_count,
-    COUNT(CASE WHEN i.bounty > 0 AND (is_private is not true or chute_id = '561e4875-254d-588f-a36f-57c9cdef8961') THEN 1 END) AS bounty_count,
+    COUNT(CASE WHEN i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as successful_count,
     sum(
-        i.bounty +
         i.compute_multiplier *
         CASE
-            WHEN i.completed_at IS NULL OR (i.error_message IS NOT NULL AND i.error_message != '') OR (is_private is true AND chute_id != '561e4875-254d-588f-a36f-57c9cdef8961') THEN 0::float
-
             -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
             WHEN normalized_compute IS NOT NULL AND normalized_compute > 0 THEN normalized_compute
 
@@ -129,77 +156,8 @@ WITH excluded_reports AS (
         END
     ) AS compute_units
 FROM invocations i
-WHERE NOT EXISTS ( SELECT 1 FROM reports r WHERE r.confirmed_at IS NOT NULL AND r.invocation_id = i.parent_invocation_id )
+WHERE NOT EXISTS (SELECT 1 FROM reports r WHERE r.confirmed_at IS NOT NULL AND r.invocation_id = i.parent_invocation_id)
 GROUP BY hotkey;
-"""
-UNIQUE_CHUTE_AVERAGE_QUERY = """
-WITH time_series AS (
-  SELECT generate_series(
-    date_trunc('hour', now() - INTERVAL '7 days'),
-    date_trunc('hour', now()),
-    INTERVAL '1 hour'
-  ) AS time_point
-),
--- Get the latest gpu_count per chute (most recent entry only)
-latest_chute_config AS (
-  SELECT DISTINCT ON (chute_id)
-    chute_id,
-    gpu_count
-  FROM gpu_counts
-),
--- Dedupe instance_audits to get the lifecycle of each instance
-deduped_instances AS (
-  SELECT
-    instance_id,
-    chute_id,
-    miner_hotkey,
-    MIN(activated_at) AS first_activated_at,
-    MAX(deleted_at) AS last_deleted_at,
-    MAX(billed_to) AS any_billed_to
-  FROM instance_audits
-  GROUP BY instance_id, chute_id, miner_hotkey
-),
-active_chutes AS (
-  SELECT DISTINCT ON (ts.time_point, di.chute_id, di.miner_hotkey)
-    ts.time_point,
-    di.chute_id,
-    di.miner_hotkey
-  FROM time_series ts
-  JOIN deduped_instances di
-    ON di.first_activated_at <= ts.time_point
-   AND (di.last_deleted_at IS NULL OR di.last_deleted_at >= ts.time_point)
-   AND di.first_activated_at IS NOT NULL
-   AND (
-        di.any_billed_to IS NOT NULL
-        OR (COALESCE(di.last_deleted_at, ts.time_point) - di.first_activated_at >= interval '1 hour')
-   )
-),
--- Get GPU-weighted chutes for each hotkey at each time point
-gpu_weighted_data AS (
-  SELECT
-    ac.miner_hotkey,
-    ac.time_point,
-    ac.chute_id,
-    COALESCE(lcc.gpu_count, 1)::int AS gpu_weighted_chutes
-  FROM active_chutes ac
-  LEFT JOIN latest_chute_config lcc
-    ON ac.chute_id = lcc.chute_id
-),
--- Sum GPU-weighted chutes per hotkey per time point
-summed_per_timepoint AS (
-  SELECT
-    miner_hotkey,
-    time_point,
-    SUM(gpu_weighted_chutes) AS total_gpu_weighted_chutes
-  FROM gpu_weighted_data
-  GROUP BY miner_hotkey, time_point
-)
--- Calculate average across all time points per hotkey
-SELECT
-  miner_hotkey,
-  AVG(total_gpu_weighted_chutes) AS gpu_weighted_chutes
-FROM summed_per_timepoint
-GROUP BY miner_hotkey;
 """
 MISSING_INVOCATIONS_QUERY = """
 SELECT s.*
@@ -229,67 +187,199 @@ ON i.miner_hotkey = m.hotkey;
 MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
 EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
 
-PRIVATE_INSTANCES_QUERY = """
-WITH deduplicated_instance_audit AS (
-    SELECT
-        ia.instance_id,
-        (array_agg(ia.miner_hotkey      ORDER BY ia.verified_at DESC NULLS LAST))[1] AS miner_hotkey,
-        (array_agg(ia.billed_to         ORDER BY ia.verified_at DESC NULLS LAST))[1] AS billed_to,
-        (array_agg(ia.compute_multiplier ORDER BY ia.verified_at DESC NULLS LAST))[1] AS compute_multiplier,
-        MIN(ia.activated_at)      AS activated_at,
-        MAX(ia.stop_billing_at)   AS stop_billing_at,
-        MAX(ia.deleted_at)        AS deleted_at
-    FROM instance_audits ia
-    WHERE ia.billed_to IS NOT NULL
-      AND ia.activated_at IS NOT NULL
-      AND (
-            ia.deletion_reason IN (
-              'job has been terminated due to insufficient user balance',
-              'user-defined/private chute instance has not been used since shutdown_after_seconds',
-              'user has zero/negative balance (private chute)'
-            )
-         OR ia.deletion_reason LIKE '%has an old version%'
-         OR NOT EXISTS (
-                SELECT 1
-                FROM instance_audits ia2
-                WHERE ia2.instance_id = ia.instance_id
-                  AND ia2.deleted_at IS NOT NULL
-            )
-      )
-    GROUP BY ia.instance_id
+SCORING_INTERVAL = "7 days"
+
+# Bonuses applied to base score, where base score is simply compute units * instance lifetime where termination reason is valid.
+BONUS = {
+    "demand": 0.35,  # Miner generally meets the platform demands, i.e. chutes with high utilization are deployed more frequently.
+    "bounty": 0.35,  # Claimed bounties, i.e. when there was platform demand for a chute, they launched it.
+    "breadth": 0.3,  # Non-selectivity of the miner, i.e. deploying all chutes with equal weight.
+}
+DEMAND_COMPUTE_WEIGHT = 0.75
+DEMAND_COUNT_WEIGHT = 0.25
+BONUS_WEIGHT = 0.15
+BONUS_EXP = 2.0
+
+# Prevent bounty spamming.
+BOUNTY_DECAY = 0.8
+BOUNTY_RHO = 0.5
+
+# GPU inventory (and unique chute GPU).
+INVENTORY_HISTORY_QUERY = """
+WITH time_series AS (
+  SELECT generate_series(
+    date_trunc('hour', now() - INTERVAL '{interval}'),
+    date_trunc('hour', now()),
+    INTERVAL '1 hour'
+  ) AS time_point
 ),
-billed_instances AS (
+-- Get the latest gpu_count per chute (most recent entry only)
+latest_chute_config AS (
+  SELECT DISTINCT ON (chute_id)
+    chute_id,
+    gpu_count
+  FROM gpu_counts
+),
+-- ALL active instances with GPU counts
+active_instances_with_gpu AS (
+  SELECT
+    ts.time_point,
+    ia.instance_id,
+    ia.chute_id,
+    ia.miner_hotkey,
+    COALESCE(lcc.gpu_count, 1) AS gpu_count
+  FROM time_series ts
+  JOIN instance_audit ia
+    ON ia.activated_at <= ts.time_point
+   AND (ia.deleted_at IS NULL OR ia.deleted_at >= ts.time_point)
+   AND ia.activated_at IS NOT NULL
+   AND (
+        ia.billed_to IS NOT NULL
+        OR (COALESCE(ia.deleted_at, ts.time_point) - ia.activated_at >= interval '1 hour')
+   )
+  LEFT JOIN latest_chute_config lcc
+    ON ia.chute_id = lcc.chute_id
+),
+-- Calculate metrics per timepoint
+metrics_per_timepoint AS (
+  SELECT
+    time_point,
+    miner_hotkey,
+    -- For breadth: unique chutes with GPU weighting
+    (SELECT SUM(gpu_count) FROM (
+      SELECT DISTINCT ON (chute_id) chute_id, gpu_count
+      FROM active_instances_with_gpu aig2
+      WHERE aig2.time_point = aig.time_point
+        AND aig2.miner_hotkey = aig.miner_hotkey
+    ) unique_chutes) AS gpu_weighted_unique_chutes,
+    -- For stability: total GPUs across all instances
+    SUM(gpu_count) AS total_active_gpus
+  FROM active_instances_with_gpu aig
+  GROUP BY time_point, miner_hotkey
+)
+-- Return the history for both metrics
+SELECT
+  time_point::text,
+  miner_hotkey,
+  COALESCE(gpu_weighted_unique_chutes, 0) AS unique_chute_gpus,
+  COALESCE(total_active_gpus, 0) AS total_active_gpus
+FROM metrics_per_timepoint
+ORDER BY miner_hotkey, time_point
+"""
+INVENTORY_QUERY = (
+    """
+SELECT
+  miner_hotkey,
+  AVG(unique_chute_gpus)::integer AS avg_unique_chute_gpus,
+  AVG(total_active_gpus)::integer AS avg_total_active_gpus
+FROM ("""
+    + INVENTORY_HISTORY_QUERY
+    + """) AS history_data
+GROUP BY miner_hotkey
+ORDER BY avg_unique_chute_gpus DESC
+"""
+)
+
+# Instances lifetime/compute units queries - this is the entire basis for scoring!
+INSTANCES_QUERY = """
+WITH billed_instances AS (
     SELECT
         ia.miner_hotkey,
         ia.instance_id,
+        ia.chute_id,
         ia.activated_at,
+        ia.deleted_at,
         ia.stop_billing_at,
         ia.compute_multiplier,
-        GREATEST(ia.activated_at, now() - interval '7 days') AS billing_start,
+        ia.bounty,
+        GREATEST(ia.activated_at, now() - interval '{interval}') as billing_start,
         LEAST(
             COALESCE(ia.stop_billing_at, now()),
-            COALESCE(ia.deleted_at,     now()),
+            COALESCE(ia.deleted_at, now()),
             now()
-        ) AS billing_end
-    FROM deduplicated_instance_audit ia
-    WHERE (ia.stop_billing_at IS NULL OR ia.stop_billing_at >= now() - interval '7 days')
+        ) as billing_end
+    FROM instance_audit ia
+    WHERE ia.activated_at IS NOT NULL
+      AND (
+          (
+            ia.billed_to IS NULL
+            AND ia.deleted_at IS NOT NULL
+            AND ia.deleted_at - ia.activated_at >= INTERVAL '1 hour'
+          )
+          OR ia.valid_termination IS TRUE
+          OR ia.deletion_reason in (
+              'job has been terminated due to insufficient user balance',
+              'user-defined/private chute instance has not been used since shutdown_after_seconds',
+              'user has zero/negative balance (private chute)'
+          )
+          OR ia.deletion_reason LIKE '%has an old version%'
+          OR ia.deleted_at IS NULL
+      )
+      AND (ia.deleted_at IS NULL OR ia.deleted_at >= now() - interval '{interval}')
 ),
+
+-- Count total bounties per chute in the interval
+chute_bounty_totals AS (
+    SELECT
+        bi.chute_id,
+        COUNT(*)::bigint AS n_total
+    FROM billed_instances bi
+    WHERE bi.bounty IS TRUE
+      AND bi.billing_end > bi.billing_start
+    GROUP BY bi.chute_id
+),
+
+-- Count bounties per miner per chute in the interval
+miner_chute_bounty_counts AS (
+    SELECT
+        bi.miner_hotkey,
+        bi.chute_id,
+        COUNT(*)::bigint AS n_miner_chute
+    FROM billed_instances bi
+    WHERE bi.bounty IS TRUE
+      AND bi.billing_end > bi.billing_start
+    GROUP BY bi.miner_hotkey, bi.chute_id
+),
+
+-- Convert counts to an "effective" bounty score with:
+--   per-miner geometric diminishing + global chute dampening
+miner_bounty_effective AS (
+    SELECT
+        mcbc.miner_hotkey,
+        SUM(
+            (1.0 - POWER({bounty_decay}, mcbc.n_miner_chute::double precision))
+            / (1.0 - {bounty_decay})
+            *
+            POWER(GREATEST(cbt.n_total, 1)::double precision, {bounty_rho} - 1.0)
+        ) AS bounty_score
+    FROM miner_chute_bounty_counts mcbc
+    JOIN chute_bounty_totals cbt USING (chute_id)
+    GROUP BY mcbc.miner_hotkey
+),
+
+-- Aggregate compute units by miner (and pull in the effective bounty score)
 miner_compute_units AS (
     SELECT
-        miner_hotkey,
+        bi.miner_hotkey,
         COUNT(*) AS total_instances,
-        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)))                         AS compute_seconds,
-        SUM(EXTRACT(EPOCH FROM (billing_end - billing_start)) * compute_multiplier)    AS compute_units
-    FROM billed_instances
-    WHERE billing_end > billing_start
-    GROUP BY miner_hotkey
+        COALESCE(mbe.bounty_score, 0.0) AS bounty_score,
+        SUM(EXTRACT(EPOCH FROM (bi.billing_end - bi.billing_start))) AS compute_seconds,
+        SUM(EXTRACT(EPOCH FROM (bi.billing_end - bi.billing_start)) * bi.compute_multiplier) AS compute_units
+    FROM billed_instances bi
+    LEFT JOIN miner_bounty_effective mbe
+           ON mbe.miner_hotkey = bi.miner_hotkey
+    WHERE bi.billing_end > bi.billing_start
+    GROUP BY bi.miner_hotkey, mbe.bounty_score
 )
+
 SELECT
     miner_hotkey,
     total_instances,
+    bounty_score,
     COALESCE(compute_seconds, 0) AS compute_seconds,
-    COALESCE(compute_units,  0) AS compute_units
-FROM miner_compute_units;
+    COALESCE(compute_units, 0)  AS compute_units
+FROM miner_compute_units
+ORDER BY compute_units DESC
 """
 
 
@@ -445,6 +535,8 @@ class InstanceAudit(Base):
     stop_billing_at = Column(DateTime(timezone=False), nullable=True)
     billed_to = Column(String, nullable=True)
     compute_multiplier = Column(Double, nullable=True)
+    valid_termination = Column(Boolean, default=False)
+    bounty = Column(Boolean, default=False)
 
 
 class Job(Base):
@@ -656,6 +748,103 @@ class Auditor:
                     {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]},
                 )
             await session.commit()
+
+    async def reconcile_instance_audit_deletions(self, conn):
+        """
+        Backfill missing deleted_at values in instance_audits from the authoritative CSV feed.
+        """
+        url = "https://api.chutes.ai/instances/reconciliation_csv"
+        with open("reconciliation_data.csv", "w") as outfile:
+            async with self.aiosession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"Unable to fetch reconciliation csv ({resp.status}), skipping deleted_at backfill"
+                        )
+                        return
+                    outfile.write(await resp.text())
+
+        sql_script = """
+BEGIN;
+CREATE TABLE IF NOT EXISTS tmp_instance_deletions (
+    instance_id text PRIMARY KEY,
+    deleted_at timestamp without time zone
+);
+TRUNCATE tmp_instance_deletions;
+\\copy tmp_instance_deletions (instance_id, deleted_at) FROM 'reconciliation_data.csv' WITH (FORMAT csv, HEADER true);
+UPDATE instance_audits ia
+SET deleted_at = tmp.deleted_at
+FROM tmp_instance_deletions tmp
+WHERE ia.instance_id = tmp.instance_id
+  AND ia.deleted_at IS NULL
+  AND tmp.deleted_at IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM instance_audits ia_existing
+    WHERE ia_existing.instance_id = ia.instance_id
+      AND ia_existing.deleted_at IS NOT NULL
+  );
+COMMIT;
+"""
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PGUSER": POSTGRES_USER,
+                "PGPASSWORD": POSTGRES_PASSWORD,
+                "PGHOST": POSTGRES_HOST,
+                "PGPORT": str(POSTGRES_PORT),
+                "PGDATABASE": POSTGRES_DB,
+            }
+        )
+        cmd = [
+            "psql",
+            "--no-psqlrc",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "--dbname",
+            POSTGRES_DB,
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await process.communicate(sql_script.encode("utf-8"))
+        except FileNotFoundError:
+            logger.error("psql command not found; ensure PostgreSQL client tools are installed.")
+            Path("reconciliation_data.csv").unlink(missing_ok=True)
+            return
+
+        Path("reconciliation_data.csv").unlink(missing_ok=True)
+
+        if process.returncode != 0:
+            logger.error(
+                f"psql reconcile failed (exit {process.returncode}): {stderr.decode().strip()}"
+            )
+            return
+
+        stdout_text = stdout.decode().strip()
+        updated_rows = 0
+        for line in reversed(stdout_text.splitlines()):
+            match = re.search(r"UPDATE (\\d+)", line)
+            if match:
+                updated_rows = int(match.group(1))
+                break
+        logger.info(
+            f"Reconciled deleted_at for {updated_rows} instance_audits records via psql bulk import"
+        )
+
+    async def reconcile_instance_audit(self):
+        """
+        Standalone entrypoint for reconciling instance_audit deletions.
+        """
+        async with engine.begin() as conn:
+            await self.reconcile_instance_audit_deletions(conn)
 
     def get_random_image_payload(self, model: str):
         """
@@ -1501,15 +1690,22 @@ class Auditor:
         """
         Get weights to set from the invocation data.
         """
-
         if not hotkeys_to_node_ids:
             with self.substrate() as substrate:
                 all_nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
                 hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
 
-        query = text(MINER_METRICS_QUERY)
-        raw_compute_values = {}
-        highest_unique = 0
+        compute_query = text(NORMALIZED_COMPUTE_QUERY.format(interval=SCORING_INTERVAL))
+        inventory_query = text(INVENTORY_QUERY.format(interval=SCORING_INTERVAL))
+        instances_query = text(
+            INSTANCES_QUERY.format(
+                interval=SCORING_INTERVAL, bounty_decay=BOUNTY_DECAY, bounty_rho=BOUNTY_RHO
+            )
+        )
+
+        # Load active miners from metagraph (and map coldkey pairings to de-dupe multi-hotkey miners).
+        raw_values = {}
+        logger.info("Loading metagraph for netuid=64...")
         async with get_session() as session:
             metagraph_nodes = await session.execute(
                 text(
@@ -1517,124 +1713,195 @@ class Auditor:
                 )
             )
             hot_cold_map = {hotkey: coldkey for coldkey, hotkey in metagraph_nodes}
+            coldkey_counts = {
+                coldkey: sum([1 for _, ck in hot_cold_map.items() if ck == coldkey])
+                for coldkey in hot_cold_map.values()
+            }
 
-            # Get compute units/total/bounties.
-            compute_result = await session.execute(query)
-            for hotkey, invocation_count, bounty_count, compute_units in compute_result:
-                if hotkey is None or hotkey not in hot_cold_map:
-                    continue
-                raw_compute_values[hotkey] = {
-                    "invocation_count": invocation_count,
-                    "bounty_count": bounty_count,
-                    "compute_units": compute_units,
-                    "unique_chute_count": 0,
-                }
-            unique_query = text(UNIQUE_CHUTE_AVERAGE_QUERY)
-            unique_result = await session.execute(unique_query)
-            for miner_hotkey, average_active_chutes in unique_result:
-                if miner_hotkey is None or miner_hotkey not in raw_compute_values:
-                    continue
-                raw_compute_values[miner_hotkey]["unique_chute_count"] = int(average_active_chutes)
-                if average_active_chutes > highest_unique:
-                    highest_unique = int(average_active_chutes)
-
-            # Private instances.
-            private_result = await session.execute(text(PRIVATE_INSTANCES_QUERY))
-            for miner_hotkey, total_instances, seconds, compute_units in private_result:
-                if miner_hotkey not in raw_compute_values:
-                    continue
-                logger.info(
-                    f"{miner_hotkey=} had {total_instances} private instances, {seconds=} {compute_units=}"
-                )
-                raw_compute_values[miner_hotkey]["bounty_count"] += total_instances
-                raw_compute_values[miner_hotkey]["compute_units"] += compute_units
-
-                # XXX Subject to change, but for now give one invocation per second for private instances.
-                raw_compute_values[miner_hotkey]["invocation_count"] += int(seconds)
-
-        # Normalize the values based on totals so they are all in the range [0.0, 1.0]
-        totals = {
-            key: sum(row[key] for row in raw_compute_values.values()) or 1.0
-            for key in FEATURE_WEIGHTS
-        }
-        normalized_values = {}
-        unique_scores = [
-            row["unique_chute_count"]
-            for row in raw_compute_values.values()
-            if row["unique_chute_count"]
-        ]
-        unique_scores.sort()
-        n = len(unique_scores)
-        if n > 0:
-            if n % 2 == 0:
-                median_unique_score = (unique_scores[n // 2 - 1] + unique_scores[n // 2]) / 2
-            else:
-                median_unique_score = unique_scores[n // 2]
-        else:
-            median_unique_score = 0
-        for key in FEATURE_WEIGHTS:
-            for hotkey, row in raw_compute_values.items():
-                if hotkey not in normalized_values:
-                    normalized_values[hotkey] = {}
-                if key == "unique_chute_count":
-                    if row[key] >= median_unique_score:
-                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 1.3
-                    else:
-                        normalized_values[hotkey][key] = (row[key] / highest_unique) ** 2.2
-                else:
-                    normalized_values[hotkey][key] = row[key] / totals[key]
-
-        # Re-normalize unique to [0, 1]
-        unique_sum = sum([val["unique_chute_count"] for val in normalized_values.values()])
-        for hotkey in normalized_values:
-            normalized_values[hotkey]["unique_chute_count"] /= unique_sum
-
-        # Adjust the values by the feature weights, e.g. compute_time gets more weight than bounty count.
-        pre_final_scores = {
-            hotkey: sum(norm_value * FEATURE_WEIGHTS[key] for key, norm_value in metrics.items())
-            for hotkey, metrics in normalized_values.items()
-        }
-
-        # Punish multi-uid miners.
-        sorted_hotkeys = sorted(
-            pre_final_scores.keys(), key=lambda h: pre_final_scores[h], reverse=True
+        # Base score - instances active during the scoring period.
+        logger.info(
+            "Fetching base score values based on active instances during scoring interval..."
         )
-        coldkey_counts = {
-            coldkey: sum([1 for _, ck in hot_cold_map.items() if ck == coldkey])
-            for coldkey in hot_cold_map.values()
-        }
-        penalized_scores = {}
-        coldkey_used = set()
-        for hotkey in sorted_hotkeys:
-            coldkey = hot_cold_map[hotkey]
-            if coldkey in coldkey_used:
-                logger.warning(
-                    f"Zeroing multi-uid miner {hotkey=} {coldkey=} count={coldkey_counts[coldkey]}"
-                )
-                penalized_scores[hotkey] = 0.0
-            else:
-                penalized_scores[hotkey] = pre_final_scores[hotkey]
-            coldkey_used.add(coldkey)
+        async with get_session() as session:
+            instances_result = await session.execute(instances_query)
+            for (
+                hotkey,
+                total_instances,
+                bounty_score,
+                instance_seconds,
+                instance_compute_units,
+            ) in instances_result:
+                if not hotkey or hotkey not in hot_cold_map:
+                    continue
+                raw_values[hotkey] = {
+                    "total_instances": float(total_instances or 0.0),
+                    "bounty_score": float(bounty_score or 0.0),
+                    "instance_seconds": float(instance_seconds or 0.0),
+                    "instance_compute_units": float(instance_compute_units or 0.0),
+                    "invocation_compute_units": 0.0,
+                    "invocation_count": 0.0,
+                    "unique_chute_gpus": 0.0,
+                }
 
-        # Normalize final scores by sum of penalized scores, just to make the incentive value match nicely.
-        total = sum([val for hk, val in penalized_scores.items()])
-        final_scores = {key: score / total for key, score in penalized_scores.items() if score > 0}
-        sorted_hotkeys = sorted(final_scores.keys(), key=lambda h: final_scores[h], reverse=True)
-        for hotkey in sorted_hotkeys:
-            coldkey_count = coldkey_counts[hot_cold_map[hotkey]]
-            logger.info(f"{hotkey} ({coldkey_count=}): {final_scores[hotkey]}")
+        # Get the invocation metrics to calculate boosts for "demand"
+        logger.info("Fetching invocation metrics to calculate demand boost...")
+        async with get_session() as session:
+            compute_result = await session.execute(compute_query)
+            for hotkey, count, compute_units in compute_result:
+                if hotkey not in raw_values:
+                    continue
+                raw_values[hotkey]["invocation_compute_units"] = float(compute_units or 0.0)
+                raw_values[hotkey]["invocation_count"] = count
+
+        # Get the unique chute ("breadth" bonus) data.
+        logger.info("Fetching unique chute GPU score to calculate breadth bonus...")
+        async with get_session() as session:
+            unique_result = await session.execute(inventory_query)
+            for hotkey, unique_chute_gpus, total_active_gpus in unique_result:
+                if hotkey not in raw_values:
+                    continue
+                raw_values[hotkey]["unique_chute_gpus"] = float(unique_chute_gpus or 0.0)
+
+        # Build base scores from instance compute units.
+        base_scores = {hk: data["instance_compute_units"] for hk, data in raw_values.items()}
+
+        # Purge multi-hotkey miners - keep only the highest scoring hotkey per coldkey
+        hotkeys_to_remove = set()
+        for coldkey in set(hot_cold_map.values()):
+            if coldkey_counts.get(coldkey, 0) > 1:
+                coldkey_hotkeys = [
+                    hk for hk, ck in hot_cold_map.items() if ck == coldkey and hk in base_scores
+                ]
+                if len(coldkey_hotkeys) > 1:
+                    coldkey_hotkeys.sort(key=lambda hk: base_scores.get(hk, 0.0), reverse=True)
+                    hotkeys_to_remove.update(coldkey_hotkeys[1:])
+
+        for hotkey in hotkeys_to_remove:
+            base_scores.pop(hotkey, None)
+            raw_values.pop(hotkey, None)
+            logger.warning(f"Purging hotkey from multi-uid miner: {hotkey=}")
+
+        # Helpers
+        def minmax_then_exp_to_dist(values_map: dict[str, float], exp: float) -> dict[str, float]:
+            """
+            Min-max to [0,1], raise to 'exp', then sum-normalize to a distribution.
+            Returns a dict that sums to 1 across keys (unless empty).
+            """
+            if not values_map:
+                return {}
+            vals = list(values_map.values())
+            vmin, vmax = min(vals), max(vals)
+            rng = max(vmax - vmin, 1e-12)
+
+            powered = {k: ((v - vmin) / rng) ** exp for k, v in values_map.items()}
+            S = sum(powered.values())
+            if S <= 0:
+                # uniform fallback
+                n = len(powered)
+                return {k: 1.0 / n for k in powered}
+            return {k: powered[k] / S for k in powered}
+
+        def category_from_raw(raw_key: str) -> dict[str, float]:
+            return {hk: raw_values[hk].get(raw_key, 0.0) for hk in raw_values.keys()}
+
+        base_sum = sum(max(0.0, v) for v in base_scores.values())
+        base_dist = {}
+        if base_sum > 0:
+            base_dist = {hk: max(0.0, v) / base_sum for hk, v in base_scores.items()}
+        else:
+            n = max(len(base_scores), 1)
+            base_dist = {hk: 1.0 / n for hk in base_scores.keys()}
+
+        base_weight = 1.0 - BONUS_WEIGHT
+        base_contrib = {hk: base_weight * base_dist.get(hk, 0.0) for hk in raw_values.keys()}
+
+        logger.info("Computing bonus distributions...")
+
+        # Category raw maps
+        breadth_raw = category_from_raw("unique_chute_gpus")
+        invoc_compute_raw = category_from_raw("invocation_compute_units")
+        invoc_count_raw = category_from_raw("invocation_count")
+        bounty_raw = category_from_raw("bounty_score")
+
+        # Demand raw is a weighted mix of invoc compute & count (still per-miner raw before dist)
+        demand_raw = {}
+        for hk in raw_values.keys():
+            dcw = float(DEMAND_COMPUTE_WEIGHT)
+            dnw = float(DEMAND_COUNT_WEIGHT)
+            ws = max(dcw + dnw, 1e-12)
+            demand_raw[hk] = (
+                dcw * invoc_compute_raw.get(hk, 0.0) + dnw * invoc_count_raw.get(hk, 0.0)
+            ) / ws
+
+        # Turn each category into a distribution via min-max → exp → sum-normalize
+        breadth_dist = minmax_then_exp_to_dist(breadth_raw, BONUS_EXP)
+        demand_dist = minmax_then_exp_to_dist(demand_raw, BONUS_EXP)
+        bounty_dist = minmax_then_exp_to_dist(bounty_raw, BONUS_EXP)
+
+        # Normalize BONUS weights across the categories that we’re actually using.
+        w_breadth = float(BONUS.get("breadth", 0.0))
+        w_demand = float(BONUS.get("demand", 0.0))
+        w_bounty = float(BONUS.get("bounty", 0.0))
+        W = max(w_breadth + w_demand + w_bounty, 1e-12)
+        wb, wd, wbo = w_breadth / W, w_demand / W, w_bounty / W
+
+        # Blend category distributions into a single bonus distribution and scale by bonus weight.
+        blended_bonus_dist = {}
+        for hk in raw_values.keys():
+            blended_bonus_dist[hk] = (
+                wb * breadth_dist.get(hk, 0.0)
+                + wd * demand_dist.get(hk, 0.0)
+                + wbo * bounty_dist.get(hk, 0.0)
+            )
+        bonus_weight = BONUS_WEIGHT
+        bonus_contrib = {
+            hk: bonus_weight * blended_bonus_dist.get(hk, 0.0) for hk in raw_values.keys()
+        }
+
+        final_scores = {
+            hk: base_contrib.get(hk, 0.0) + bonus_contrib.get(hk, 0.0) for hk in raw_values.keys()
+        }
+        sorted_hotkeys = sorted(final_scores.keys(), key=lambda k: final_scores[k], reverse=True)
+        logger.info(
+            f"{'#':<3} "
+            f"{'Hotkey':<48} "
+            f"{'Score':<10} "
+            f"{'Base':<10} "
+            f"{'Breadth':<10} "
+            f"{'Demand':<10} "
+            f"{'Bounty':<10}"
+        )
+        logger.info("-" * 120)
+        for rank, hotkey in enumerate(sorted_hotkeys, 1):
+            b_total = bonus_contrib.get(hotkey, 0.0)
+            eps = 1e-12
+            cat_share = (
+                wb * breadth_dist.get(hotkey, 0.0)
+                + wd * demand_dist.get(hotkey, 0.0)
+                + wbo * bounty_dist.get(hotkey, 0.0)
+            ) + eps
+            breadth_c = b_total * (wb * breadth_dist.get(hotkey, 0.0)) / cat_share
+            demand_c = b_total * (wd * demand_dist.get(hotkey, 0.0)) / cat_share
+            bounty_c = b_total * (wbo * bounty_dist.get(hotkey, 0.0)) / cat_share
+            logger.info(
+                f"{rank:<3} "
+                f"{hotkey:<48} "
+                f"{final_scores[hotkey]:<10.6f} "
+                f"{base_contrib.get(hotkey, 0.0):<10.6f} "
+                f"{breadth_c:<10.6f} "
+                f"{demand_c:<10.6f} "
+                f"{bounty_c:<10.6f} "
+            )
 
         # Final weights per node.
         node_ids = []
         node_weights = []
-        for hotkey, compute_score in final_scores.items():
+        for hotkey, score in final_scores.items():
             if hotkey not in hotkeys_to_node_ids:
                 logger.debug(f"Miner {hotkey} not found on metagraph. Ignoring.")
                 continue
-
-            node_weights.append(compute_score)
+            node_weights.append(score)
             node_ids.append(hotkeys_to_node_ids[hotkey])
-            logger.info(f"Normalized score for {hotkey}: {compute_score}")
 
         return node_ids, node_weights
 
@@ -2119,6 +2386,50 @@ class Auditor:
                 )
             )
 
+            await conn.execute(
+                text("""
+                ALTER TABLE instance_audits ADD COLUMN IF NOT EXISTS valid_termination boolean NOT NULL DEFAULT false
+            """)
+            )
+            await conn.execute(
+                text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'instance_audits'
+                  AND column_name = 'bounty'
+              ) THEN
+                ALTER TABLE instance_audits
+                ADD COLUMN bounty boolean DEFAULT false;
+
+                UPDATE instance_audits ia
+                SET bounty = true
+                WHERE instance_id IN (
+                  SELECT DISTINCT(instance_id)
+                  FROM invocations
+                  WHERE bounty > 0
+                );
+              END IF;
+            END
+            $$;
+            """)
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_ia_id ON instance_audits(instance_id);")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_ia_da ON instance_audits(deleted_at);")
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_ia_idd ON instance_audits(instance_id, deleted_at);"
+                )
+            )
+            await conn.execute(text(INSTANCE_AUDIT_VIEW))
+
         tasks = []
         try:
             tasks.append(asyncio.create_task(self.verify_integrity_and_set_weights()))
@@ -2150,6 +2461,8 @@ async def main():
     fix_reports_path()
     if "--recover" in sys.argv:
         await auditor.recover_instance_audits()
+    elif "--reconcile" in sys.argv:
+        await auditor.reconcile_instance_audit()
     else:
         await auditor.run()
 
