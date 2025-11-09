@@ -1633,6 +1633,9 @@ COMMIT;
                     audit_data_dict["billed_to"] = None
                 if audit_data_dict.get("miner_uid") is not None:
                     audit_data_dict["miner_uid"] = int(audit_data_dict["miner_uid"])
+                if "valid_termination" not in audit_data_dict:
+                    audit_data_dict["valid_termination"] = False
+                audit_data_dict["valid_termination"] = bool(audit_data_dict["valid_termination"])
                 async with get_session() as session:
                     stmt = insert(InstanceAudit).values(**audit_data_dict)
                     stmt = stmt.on_conflict_do_nothing(index_elements=["audit_id"])
