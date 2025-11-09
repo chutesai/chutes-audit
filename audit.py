@@ -634,69 +634,6 @@ class GPUCount(Base):
     gpu_count = Column(Integer)
 
 
-async def update_instance_multiplier_with_boosts():
-    """
-    Fetch chute boosts from the API and scale compute_multiplier for matching audits.
-    """
-    url = "https://api.chutes.ai/chutes/boosted"
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    body_preview = (await response.text())[:200]
-                    logger.warning(f"Boost fetch failed (status={response.status}): {body_preview}")
-                    return
-                payload = await response.json()
-    except Exception as exc:
-        logger.error(f"Failed to fetch boosted chutes: {exc}")
-        return
-
-    if not isinstance(payload, list):
-        logger.warning("Unexpected boosted chutes payload; expected a list.")
-        return
-
-    boosts: dict[str, float] = {}
-    for entry in payload:
-        if not isinstance(entry, dict):
-            continue
-        chute_id = entry.get("chute_id")
-        name = entry.get("name")
-        boost_value = entry.get("boost")
-        if not chute_id or boost_value is None:
-            continue
-        try:
-            boost_float = float(boost_value)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= boost_float <= 20:
-            boosts[chute_id] = boost_float
-        logger.info(f"Updating {chute_id=} chute_{name=} multiplier to have {boost_value=}")
-
-    if not boosts:
-        logger.info("No valid chute boosts to apply.")
-        return
-
-    total_updated = 0
-    async with engine.begin() as conn:
-        for chute_id, boost in boosts.items():
-            result = await conn.execute(
-                text(
-                    """
-                    UPDATE instance_audits
-                    SET compute_multiplier = compute_multiplier * :boost
-                    WHERE chute_id = :chute_id
-                      AND compute_multiplier IS NOT NULL
-                    """
-                ),
-                {"chute_id": chute_id, "boost": boost},
-            )
-            total_updated += result.rowcount or 0
-
-    logger.info(
-        f"Applied boosts for {len(boosts)} chutes; updated {total_updated} instance_audits rows."
-    )
-
-
 class Auditor:
     def __init__(self, config_path: str = None):
         """
@@ -2385,23 +2322,7 @@ COMMIT;
         """
         Main loop, to do all the things.
         """
-        needs_boost_migration = False
         async with engine.begin() as conn:
-            bounty_column_result = await conn.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = 'public'
-                          AND table_name = 'instance_audits'
-                          AND column_name = 'bounty'
-                    )
-                    """
-                )
-            )
-            bounty_column_exists = bool(bounty_column_result.scalar() or False)
-            needs_boost_migration = not bounty_column_exists
             await conn.execute(
                 text("""
                 DO $$
@@ -2508,10 +2429,6 @@ COMMIT;
                 )
             )
             await conn.execute(text(INSTANCE_AUDIT_VIEW))
-
-        # One time boost multiplier update.
-        if needs_boost_migration:
-            await update_instance_multiplier_with_boosts()
 
         tasks = []
         try:
