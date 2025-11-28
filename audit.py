@@ -240,6 +240,19 @@ active_instances_with_gpu AS (
   LEFT JOIN latest_chute_config lcc
     ON ia.chute_id = lcc.chute_id
 ),
+-- Get all miners who had any activity in the interval
+all_miners AS (
+  SELECT DISTINCT miner_hotkey
+  FROM active_instances_with_gpu
+),
+-- Cross join to get every miner x every hour
+miner_time_series AS (
+  SELECT
+    ts.time_point,
+    am.miner_hotkey
+  FROM time_series ts
+  CROSS JOIN all_miners am
+),
 -- Calculate metrics per timepoint
 metrics_per_timepoint AS (
   SELECT
@@ -257,14 +270,17 @@ metrics_per_timepoint AS (
   FROM active_instances_with_gpu aig
   GROUP BY time_point, miner_hotkey
 )
--- Return the history for both metrics
+-- Return the history for both metrics (with zeros for missing hours)
 SELECT
-  time_point::text,
-  miner_hotkey,
-  COALESCE(gpu_weighted_unique_chutes, 0) AS unique_chute_gpus,
-  COALESCE(total_active_gpus, 0) AS total_active_gpus
-FROM metrics_per_timepoint
-ORDER BY miner_hotkey, time_point
+  mts.time_point::text,
+  mts.miner_hotkey,
+  COALESCE(mpt.gpu_weighted_unique_chutes, 0) AS unique_chute_gpus,
+  COALESCE(mpt.total_active_gpus, 0) AS total_active_gpus
+FROM miner_time_series mts
+LEFT JOIN metrics_per_timepoint mpt
+  ON mts.time_point = mpt.time_point
+  AND mts.miner_hotkey = mpt.miner_hotkey
+ORDER BY mts.miner_hotkey, mts.time_point
 """
 INVENTORY_QUERY = (
     """
@@ -782,6 +798,7 @@ WHERE ia.instance_id = tmp.instance_id
     SELECT 1
     FROM instance_audits ia_existing
     WHERE ia_existing.instance_id = ia.instance_id
+      AND ia_existing.source = 'validator'
       AND ia_existing.deleted_at IS NOT NULL
   );
 COMMIT;
@@ -2094,6 +2111,14 @@ COMMIT;
             logger.info("No new audit data to process.")
         else:
             logger.success(f"Successfully processed {total} new audit reports.")
+
+        if validator_total > 0:
+            logger.info(
+                f"Reconciling instance audit deletions after processing {validator_total} new validator records..."
+            )
+            async with engine.begin() as conn:
+                await self.reconcile_instance_audit_deletions(conn)
+
         return validator_total
 
     async def send_and_verify_synthetics(self):
