@@ -1442,7 +1442,7 @@ COMMIT;
             db_record, path, audit_content
         ):
             raise IntegrityViolation(
-                f"Commitment on chain does not match downloaded report! {db_record.record_id}"
+                f"Commitment on chain does not match downloaded report! {db_record=}"
             )
         return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
