@@ -25,7 +25,7 @@ greenlet = "^3.1.1"
 soundfile = "^0.13.1"
 backoff = "^2.2.1"
 tqdm = "^4.67.1"
-fiber = {git = "https://github.com/rayonlabs/fiber.git", rev = "2.2.3"}
+fiber = {git = "https://github.com/rayonlabs/fiber.git", rev = "a41ab890708757140a3cf4aae8e5af57a8b03159"}
 cryptography = "<44"
 setuptools = "^75.8.0"
 psutil = "^7.0.0"
