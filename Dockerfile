@@ -1,10 +1,7 @@
 FROM python:3.12
 RUN apt update && apt-get -y install libportaudio2 build-essential curl postgresql-client
-RUN curl -sSL https://install.python-poetry.org | python3 -
-ADD pyproject.toml /audit/
-ADD poetry.lock /audit/
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
-ENV PATH=/root/.local/bin:/root/.cargo/bin:$PATH
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ADD pyproject.toml uv.lock README.md /audit/
 WORKDIR /audit
-RUN poetry install --no-root
+RUN uv sync --frozen
 ADD audit.py /audit/audit.py
