@@ -115,10 +115,6 @@ VERSION_KEY = 69420
 
 SCORING_INTERVAL = "7 days"
 
-# Bounty decay/rho for the instances query (kept for data tracking).
-BOUNTY_DECAY = 0.8
-BOUNTY_RHO = 0.5
-
 # Instances lifetime/compute units queries - this is the entire basis for scoring!
 # Uses instance_compute_history for accurate time-weighted multipliers.
 # The history table includes the startup period (created_at to activated_at) at 0.3x rate,
@@ -480,7 +476,13 @@ class Auditor:
 
     async def reconcile_instance_audit_deletions(self, conn):
         """
-        Backfill missing deleted_at values in instance_audits from the authoritative CSV feed.
+        Reconcile instance_audits from the authoritative CSV feed.
+
+        The reconciliation CSV represents the complete set of known instances from the
+        validator's perspective. This method:
+        1. Deletes any instance_audits records where the instance_id is not in the CSV
+           (stale/old records that no longer exist)
+        2. Updates deleted_at timestamps for remaining records based on the CSV
         """
         url = "https://api.chutes.ai/instances/reconciliation_csv"
         with open("reconciliation_data.csv", "w") as outfile:
@@ -488,10 +490,20 @@ class Auditor:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         logger.warning(
-                            f"Unable to fetch reconciliation csv ({resp.status}), skipping deleted_at backfill"
+                            f"Unable to fetch reconciliation csv ({resp.status}), skipping reconciliation"
                         )
                         return
-                    outfile.write(await resp.text())
+                    csv_content = await resp.text()
+                    outfile.write(csv_content)
+
+        # Safety check: ensure we have actual data (not just a header or empty response)
+        lines = csv_content.strip().split("\n")
+        if len(lines) < 2:
+            logger.error(
+                "Reconciliation CSV is empty or contains only headers, aborting to prevent data loss"
+            )
+            Path("reconciliation_data.csv").unlink(missing_ok=True)
+            return
 
         sql_script = """
 BEGIN;
@@ -501,19 +513,18 @@ CREATE TABLE IF NOT EXISTS tmp_instance_deletions (
 );
 TRUNCATE tmp_instance_deletions;
 \\copy tmp_instance_deletions (instance_id, deleted_at) FROM 'reconciliation_data.csv' WITH (FORMAT csv, HEADER true);
+
+-- Delete stale records: any instance_audits where instance_id is not in the reconciliation CSV
+DELETE FROM instance_audits
+WHERE instance_id NOT IN (SELECT instance_id FROM tmp_instance_deletions);
+
+-- Update deleted_at for remaining records based on the CSV
 UPDATE instance_audits ia
 SET deleted_at = tmp.deleted_at
 FROM tmp_instance_deletions tmp
 WHERE ia.instance_id = tmp.instance_id
   AND ia.deleted_at IS NULL
-  AND tmp.deleted_at IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1
-    FROM instance_audits ia_existing
-    WHERE ia_existing.instance_id = ia.instance_id
-      AND ia_existing.source = 'validator'
-      AND ia_existing.deleted_at IS NOT NULL
-  );
+  AND tmp.deleted_at IS NOT NULL;
 COMMIT;
 """
 
@@ -559,61 +570,35 @@ COMMIT;
             return
 
         stdout_text = stdout.decode().strip()
+        deleted_rows = 0
         updated_rows = 0
-        for line in reversed(stdout_text.splitlines()):
-            match = re.search(r"UPDATE (\\d+)", line)
-            if match:
-                updated_rows = int(match.group(1))
-                break
+        for line in stdout_text.splitlines():
+            delete_match = re.search(r"DELETE (\d+)", line)
+            update_match = re.search(r"UPDATE (\d+)", line)
+            if delete_match:
+                deleted_rows = int(delete_match.group(1))
+            if update_match:
+                updated_rows = int(update_match.group(1))
         logger.info(
-            f"Reconciled deleted_at for {updated_rows} instance_audits records via psql bulk import"
+            f"Reconciled instance_audits: deleted {deleted_rows} stale records, "
+            f"updated deleted_at for {updated_rows} records"
         )
 
     async def reconcile_instance_compute_history(self):
         """
-        Reconcile instance_compute_history ended_at values based on instance_audit deleted_at.
-        For any instance that has been deleted (deleted_at set in instance_audit),
-        ensure the corresponding compute_history records have ended_at set.
-        """
-        async with get_session() as session:
-            result = await session.execute(
-                text("""
-                    UPDATE instance_compute_history ich
-                    SET ended_at = ia.deleted_at
-                    FROM instance_audit ia
-                    WHERE ich.instance_id = ia.instance_id
-                      AND ich.ended_at IS NULL
-                      AND ia.deleted_at IS NOT NULL
-                """)
-            )
-            updated = result.rowcount
-            await session.commit()
-            if updated:
-                logger.info(f"Reconciled ended_at for {updated} instance_compute_history records")
-
-    async def reconcile_instance_audit(self):
-        """
-        Standalone entrypoint for reconciling instance_audit deletions and compute history.
-        """
-        async with engine.begin() as conn:
-            await self.reconcile_instance_audit_deletions(conn)
-        await self.reconcile_instance_compute_history()
-
-    @backoff.on_exception(backoff.constant, Exception, jitter=None, interval=10, max_tries=10)
-    async def sync_compute_history_from_api(self):
-        """
-        Fetch and sync instance_compute_history from the API on startup.
-        This ensures the auditor has the same compute history as the validator.
+        Full reconciliation of instance_compute_history by truncating and rebuilding
+        from the API's source of truth. This ensures consistency with the validator's
+        compute history data.
         """
         url = "https://api.chutes.ai/instances/compute_history_csv"
-        async with self.aiosession() as session:
-            async with session.get(url) as resp:
+        async with self.aiosession() as http_session:
+            async with http_session.get(url) as resp:
                 resp.raise_for_status()
                 csv_content = await resp.text()
 
         lines = csv_content.strip().split("\n")
         if len(lines) < 2:
-            logger.info("No compute history records to sync from API")
+            logger.warning("No compute history records from API, skipping reconciliation")
             return
 
         reader = csv.DictReader(lines)
@@ -633,10 +618,12 @@ COMMIT;
             )
 
         if not records:
-            logger.info("No compute history records to sync from API")
+            logger.warning("No compute history records from API, skipping reconciliation")
             return
 
+        # Truncate and rebuild in a single transaction
         async with get_session() as session:
+            await session.execute(text("TRUNCATE TABLE instance_compute_history"))
             for batch_start in range(0, len(records), 500):
                 batch = records[batch_start : batch_start + 500]
                 for record in batch:
@@ -645,15 +632,21 @@ COMMIT;
                             INSERT INTO instance_compute_history
                                 (instance_id, compute_multiplier, started_at, ended_at)
                             VALUES (:instance_id, :compute_multiplier, :started_at, :ended_at)
-                            ON CONFLICT (instance_id, started_at)
-                            DO UPDATE SET
-                                compute_multiplier = EXCLUDED.compute_multiplier,
-                                ended_at = EXCLUDED.ended_at
                         """),
                         record,
                     )
             await session.commit()
-        logger.success(f"Synced {len(records)} compute history records from API")
+        logger.success(
+            f"Reconciled instance_compute_history: truncated and rebuilt with {len(records)} records"
+        )
+
+    async def reconcile_instance_audit(self):
+        """
+        Standalone entrypoint for reconciling instance_audit deletions and compute history.
+        """
+        async with engine.begin() as conn:
+            await self.reconcile_instance_audit_deletions(conn)
+        await self.reconcile_instance_compute_history()
 
     def get_random_image_payload(self, model: str):
         """
@@ -1556,11 +1549,7 @@ COMMIT;
         # Fetch blacklisted hotkeys from the API
         blacklisted_hotkeys = await self._get_blacklisted_hotkeys()
 
-        instances_query = text(
-            INSTANCES_QUERY.format(
-                interval=SCORING_INTERVAL, bounty_decay=BOUNTY_DECAY, bounty_rho=BOUNTY_RHO
-            )
-        )
+        instances_query = text(INSTANCES_QUERY.format(interval=SCORING_INTERVAL))
 
         # Load active miners from metagraph (and map coldkey pairings to de-dupe multi-hotkey miners).
         raw_values = {}
@@ -2323,7 +2312,7 @@ COMMIT;
             await conn.execute(text(INSTANCE_AUDIT_VIEW))
 
         # Sync compute history from API on startup to ensure consistency
-        await self.sync_compute_history_from_api()
+        await self.reconcile_instance_compute_history()
 
         tasks = []
         try:
