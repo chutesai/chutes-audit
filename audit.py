@@ -1075,7 +1075,6 @@ COMMIT;
             block_hash=block_hash,
         )
         if commitment:
-            logger.info(f"COMMITMENT: {commitment=}")
             value = commitment.value if hasattr(commitment, "value") else commitment
             if value:
                 for field in value.get("info", {}).get("fields", []):
@@ -1848,7 +1847,7 @@ COMMIT;
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
-            logger.info(f"Purging old compute history data...")
+            logger.info("Purging old compute history data...")
             await session.execute(
                 text(
                     "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '169 hours'"
@@ -2333,9 +2332,7 @@ COMMIT;
                 )
             )
             await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_cmh_d ON instance_compute_history (ended_at)"
-                )
+                text("CREATE INDEX IF NOT EXISTS idx_cmh_d ON instance_compute_history (ended_at)")
             )
             await conn.execute(text(INSTANCE_AUDIT_VIEW))
 

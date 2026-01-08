@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: chutes_audit
     volumes:
-      - pg_data2:/var/lib/postgresql/data
+      - pg_data_20260108:/var/lib/postgresql/data
     restart: always
 
   auditor:
@@ -33,5 +33,5 @@ services:
       - postgres
 
 volumes:
-  pg_data2:
+  pg_data_20260108:
   hfhub:
