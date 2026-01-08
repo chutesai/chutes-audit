@@ -2134,6 +2134,8 @@ COMMIT;
                 key=lambda h: miner_stats[h]["validator_seconds"],
                 reverse=True,
             ):
+                if not hotkey or not miner_stats.get(hotkey):
+                    continue
                 s = miner_stats[hotkey]
                 if s["total"] == 0:
                     continue
@@ -2190,7 +2192,12 @@ COMMIT;
                         f"report spanning {most_recent.start_time} through {most_recent.end_time}"
                     )
                     await self.compare_weights_to_actual(await self.get_weights_to_set())
-                    await self.compare_miner_metrics()
+                    try:
+                        await self.compare_miner_metrics()
+                    except Exception as exc:
+                        logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
+                        # XXX not blocking though, because it's a comparison and miners often
+                        # don't report anyways.
             else:
                 if self.config.set_weights.enabled:
                     await self.get_and_set_weights()
@@ -2199,7 +2206,10 @@ COMMIT;
                     await self.compare_weights_to_actual(await self.get_weights_to_set())
 
                 # Compare the validator stats to miner self-reported stats.
-                await self.compare_miner_metrics()
+                try:
+                    await self.compare_miner_metrics()
+                except Exception as exc:
+                    logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
             await asyncio.sleep(60)
             first_run = False
 
