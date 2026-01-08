@@ -1,6 +1,6 @@
 # Synthetics config, which currently only supports the chutes validator but can be extended to support any.
 synthetics:
-  enabled: true
+  enabled: false
 
   # Use LLMs synthetically?
   text:

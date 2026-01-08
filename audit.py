@@ -2,48 +2,43 @@ import io
 import os
 import re
 import csv
-import ast
 import sys
-import time
 import uuid
 import glob
+import yaml
+import tqdm
 import shutil
 import random
 import aiohttp
-import yaml
-import tqdm
-import psutil
-import orjson as json
 import asyncio
-import tempfile
 import hashlib
 import backoff
+import tempfile
 import traceback
-import subprocess
-from pathlib import Path
 import numpy as np
-import pybase64 as base64
-import sounddevice as sd
+import json as jjson
+import orjson as json
 import soundfile as sf
-from typing import Optional
-from fiber import Keypair
-from fiber.chain import weights
-from fiber.chain import fetch_nodes
-from fiber.networking.models import NodeWithFernet as Node
-from fiber.chain.chain_utils import query_substrate
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import lru_cache
-from datetime import datetime, timedelta
-from langdetect import detect as detect_language
-from term_image.image import from_file as image_from_file
+import sounddevice as sd
+import pybase64 as base64
+
+from pathlib import Path
 from loguru import logger
-from typing import AsyncGenerator
+from munch import munchify
+from typing import Optional
 from pydantic import BaseModel
-from substrateinterface import SubstrateInterface
+from typing import AsyncGenerator
+from datasets import load_dataset
+from bittensor_wallet import Keypair
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from langdetect import detect as detect_language
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from term_image.image import from_file as image_from_file
 from sqlalchemy.orm import sessionmaker, declarative_base
+from async_substrate_interface import AsyncSubstrateInterface
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import (
     Column,
     String,
@@ -60,9 +55,6 @@ from sqlalchemy import (
     Index,
     or_,
 )
-from munch import munchify
-from datasets import load_dataset
-from contextlib import asynccontextmanager, contextmanager
 
 # Database configuration.
 POSTGRES_USER = os.getenv("POSTGRES_USER", "user")
@@ -122,193 +114,27 @@ JOIN LATERAL (
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 
-# Invocation metrics.
-NORMALIZED_COMPUTE_QUERY = """
-WITH excluded_reports AS (
-    SELECT invocation_id
-    FROM reports
-    WHERE confirmed_at IS NOT NULL
-) SELECT
-    i.miner_hotkey AS hotkey,
-    COUNT(CASE WHEN i.completed_at IS NOT NULL AND (i.error_message IS NULL OR i.error_message = '') THEN 1 END) as successful_count,
-    sum(
-        i.compute_multiplier *
-        CASE
-            -- For token-based computations (nc = normalized compute, handles prompt & completion tokens).
-            WHEN normalized_compute IS NOT NULL AND normalized_compute > 0 THEN normalized_compute
-
-            -- For step-based computations
-            WHEN i.metrics->>'steps' IS NOT NULL
-                AND (i.metrics->>'steps')::float > 0
-                AND i.metrics->>'masps' IS NOT NULL
-            THEN (i.metrics->>'steps')::float * (i.metrics->>'masps')::float
-
-            -- Legacy token-based computations when 'nc' is not available.
-            WHEN i.metrics->>'it' IS NOT NULL
-                AND i.metrics->>'ot' IS NOT NULL
-                AND (i.metrics->>'it')::float > 0
-                AND (i.metrics->>'ot')::float > 0
-                AND i.metrics->>'maspt' IS NOT NULL
-            THEN ((i.metrics->>'it')::float + (i.metrics->>'ot')::float) * (i.metrics->>'maspt')::float
-
-            -- Fallback to actual elapsed time
-            ELSE EXTRACT(EPOCH FROM (i.completed_at - i.started_at))
-        END
-    ) AS compute_units
-FROM invocations i
-WHERE NOT EXISTS (SELECT 1 FROM reports r WHERE r.confirmed_at IS NOT NULL AND r.invocation_id = i.parent_invocation_id)
-GROUP BY hotkey;
-"""
-MISSING_INVOCATIONS_QUERY = """
-SELECT s.*
-  FROM synthetics s
-  LEFT JOIN invocations i ON s.invocation_id = i.invocation_id
- WHERE (i.invocation_id IS NULL OR s.miner_hotkey != i.miner_hotkey)
-   AND created_at < (SELECT MAX(start_time) FROM audit_entries WHERE hotkey = '{hotkey}')
-"""
-MINER_SUMMARY_METRICS_QUERY = """
-SELECT
-   COALESCE(i.miner_hotkey, m.hotkey) as hotkey,
-   i.invocation_count,
-   m.metrics_count
-FROM
-   (SELECT miner_hotkey, COUNT(*) AS invocation_count
-    FROM invocations
-    WHERE error_message is null
-    AND miner_hotkey is not null
-    AND completed_at is not null
-    GROUP BY miner_hotkey) i
-FULL OUTER JOIN
-   (SELECT hotkey, SUM(total_count) as metrics_count
-    FROM miner_metrics
-    GROUP BY hotkey) m
-ON i.miner_hotkey = m.hotkey;
-"""
-MINER_COVERAGE_QUERY = "SELECT SUM(EXTRACT(EPOCH FROM end_time - start_time)::integer) AS coverage_seconds FROM audit_entries WHERE hotkey = '{hotkey}' AND start_time >= (now() AT TIME ZONE 'UTC') - interval '169 hours'"
-EXPECTED_COVERAGE = 7 * 24 * 60 * 60 - (60 * 60)
-
 SCORING_INTERVAL = "7 days"
 
-# Bonuses applied to base score, where base score is simply compute units * instance lifetime where termination reason is valid.
-BONUS = {
-    "demand": 0.35,  # Miner generally meets the platform demands, i.e. chutes with high utilization are deployed more frequently.
-    "bounty": 0.35,  # Claimed bounties, i.e. when there was platform demand for a chute, they launched it.
-    "breadth": 0.3,  # Non-selectivity of the miner, i.e. deploying all chutes with equal weight.
-}
-DEMAND_COMPUTE_WEIGHT = 0.75
-DEMAND_COUNT_WEIGHT = 0.25
-BONUS_WEIGHT = 0.1
-BONUS_EXP = 1.4
-
-# Prevent bounty spamming.
-BOUNTY_DECAY = 0.8
-BOUNTY_RHO = 0.5
-
-# GPU inventory (and unique chute GPU).
-INVENTORY_HISTORY_QUERY = """
-WITH time_series AS (
-  SELECT generate_series(
-    date_trunc('hour', now() - INTERVAL '{interval}'),
-    date_trunc('hour', now()),
-    INTERVAL '1 hour'
-  ) AS time_point
-),
--- Get the latest gpu_count per chute (most recent entry only)
-latest_chute_config AS (
-  SELECT DISTINCT ON (chute_id)
-    chute_id,
-    gpu_count
-  FROM gpu_counts
-),
--- ALL active instances with GPU counts
-active_instances_with_gpu AS (
-  SELECT
-    ts.time_point,
-    ia.instance_id,
-    ia.chute_id,
-    ia.miner_hotkey,
-    COALESCE(lcc.gpu_count, 1) AS gpu_count
-  FROM time_series ts
-  JOIN instance_audit ia
-    ON ia.activated_at <= ts.time_point
-   AND (ia.deleted_at IS NULL OR ia.deleted_at >= ts.time_point)
-   AND ia.activated_at IS NOT NULL
-   AND (
-        ia.billed_to IS NOT NULL
-        OR (COALESCE(ia.deleted_at, ts.time_point) - ia.activated_at >= interval '1 hour')
-   )
-  LEFT JOIN latest_chute_config lcc
-    ON ia.chute_id = lcc.chute_id
-),
--- Get all miners who had any activity in the interval
-all_miners AS (
-  SELECT DISTINCT miner_hotkey
-  FROM active_instances_with_gpu
-),
--- Cross join to get every miner x every hour
-miner_time_series AS (
-  SELECT
-    ts.time_point,
-    am.miner_hotkey
-  FROM time_series ts
-  CROSS JOIN all_miners am
-),
--- Calculate metrics per timepoint
-metrics_per_timepoint AS (
-  SELECT
-    time_point,
-    miner_hotkey,
-    -- For breadth: unique chutes with GPU weighting
-    (SELECT SUM(gpu_count) FROM (
-      SELECT DISTINCT ON (chute_id) chute_id, gpu_count
-      FROM active_instances_with_gpu aig2
-      WHERE aig2.time_point = aig.time_point
-        AND aig2.miner_hotkey = aig.miner_hotkey
-    ) unique_chutes) AS gpu_weighted_unique_chutes,
-    -- For stability: total GPUs across all instances
-    SUM(gpu_count) AS total_active_gpus
-  FROM active_instances_with_gpu aig
-  GROUP BY time_point, miner_hotkey
-)
--- Return the history for both metrics (with zeros for missing hours)
-SELECT
-  mts.time_point::text,
-  mts.miner_hotkey,
-  COALESCE(mpt.gpu_weighted_unique_chutes, 0) AS unique_chute_gpus,
-  COALESCE(mpt.total_active_gpus, 0) AS total_active_gpus
-FROM miner_time_series mts
-LEFT JOIN metrics_per_timepoint mpt
-  ON mts.time_point = mpt.time_point
-  AND mts.miner_hotkey = mpt.miner_hotkey
-ORDER BY mts.miner_hotkey, mts.time_point
-"""
-INVENTORY_QUERY = (
-    """
-SELECT
-  miner_hotkey,
-  AVG(unique_chute_gpus)::integer AS avg_unique_chute_gpus,
-  AVG(total_active_gpus)::integer AS avg_total_active_gpus
-FROM ("""
-    + INVENTORY_HISTORY_QUERY
-    + """) AS history_data
-GROUP BY miner_hotkey
-ORDER BY avg_unique_chute_gpus DESC
-"""
-)
-
 # Instances lifetime/compute units queries - this is the entire basis for scoring!
+# Uses instance_compute_history for accurate time-weighted multipliers.
+# The history table includes the startup period (created_at to activated_at) at 0.3x rate,
+# so billing_start uses created_at to capture this.
+# All bonuses (bounty, urgency, TEE, private) are baked into compute_multiplier.
 INSTANCES_QUERY = """
 WITH billed_instances AS (
     SELECT
         ia.miner_hotkey,
         ia.instance_id,
         ia.chute_id,
+        ia.created_at,
         ia.activated_at,
         ia.deleted_at,
         ia.stop_billing_at,
         ia.compute_multiplier,
         ia.bounty,
-        GREATEST(ia.activated_at, now() - interval '{interval}') as billing_start,
+        -- Start from created_at to include startup period (history has 0.3x rate for this period)
+        GREATEST(ia.created_at, now() - interval '{interval}') as billing_start,
         LEAST(
             COALESCE(ia.stop_billing_at, now()),
             COALESCE(ia.deleted_at, now()),
@@ -334,58 +160,45 @@ WITH billed_instances AS (
       AND (ia.deleted_at IS NULL OR ia.deleted_at >= now() - interval '{interval}')
 ),
 
--- Count total bounties per chute in the interval
-chute_bounty_totals AS (
+-- Calculate time-weighted compute units using history table.
+-- For each instance, sum (overlap_seconds * multiplier) across all history intervals.
+instance_weighted_compute AS (
     SELECT
-        bi.chute_id,
-        COUNT(*)::bigint AS n_total
-    FROM billed_instances bi
-    WHERE bi.bounty IS TRUE
-      AND bi.billing_end > bi.billing_start
-    GROUP BY bi.chute_id
-),
-
--- Count bounties per miner per chute in the interval
-miner_chute_bounty_counts AS (
-    SELECT
+        bi.instance_id,
         bi.miner_hotkey,
-        bi.chute_id,
-        COUNT(*)::bigint AS n_miner_chute
+        bi.billing_start,
+        bi.billing_end,
+        bi.bounty,
+        bi.compute_multiplier as fallback_multiplier,
+        COALESCE(
+            SUM(
+                EXTRACT(EPOCH FROM (
+                    LEAST(COALESCE(ich.ended_at, now()), bi.billing_end)
+                    - GREATEST(ich.started_at, bi.billing_start)
+                )) * ich.compute_multiplier
+            ),
+            -- Fallback to instance_audit.compute_multiplier if no history exists
+            EXTRACT(EPOCH FROM (bi.billing_end - bi.billing_start)) * COALESCE(bi.compute_multiplier, 1.0)
+        ) AS weighted_compute_units
     FROM billed_instances bi
-    WHERE bi.bounty IS TRUE
-      AND bi.billing_end > bi.billing_start
-    GROUP BY bi.miner_hotkey, bi.chute_id
+    LEFT JOIN instance_compute_history ich
+           ON ich.instance_id = bi.instance_id
+          AND ich.started_at < bi.billing_end
+          AND (ich.ended_at IS NULL OR ich.ended_at > bi.billing_start)
+    WHERE bi.billing_end > bi.billing_start
+    GROUP BY bi.instance_id, bi.miner_hotkey, bi.billing_start, bi.billing_end, bi.bounty, bi.compute_multiplier
 ),
 
--- Convert counts to an "effective" bounty score with:
---   per-miner geometric diminishing + global chute dampening
-miner_bounty_effective AS (
-    SELECT
-        mcbc.miner_hotkey,
-        SUM(
-            (1.0 - POWER({bounty_decay}, mcbc.n_miner_chute::double precision))
-            / (1.0 - {bounty_decay})
-            *
-            POWER(GREATEST(cbt.n_total, 1)::double precision, {bounty_rho} - 1.0)
-        ) AS bounty_score
-    FROM miner_chute_bounty_counts mcbc
-    JOIN chute_bounty_totals cbt USING (chute_id)
-    GROUP BY mcbc.miner_hotkey
-),
-
--- Aggregate compute units by miner (and pull in the effective bounty score)
+-- Aggregate compute units by miner
 miner_compute_units AS (
     SELECT
-        bi.miner_hotkey,
+        iwc.miner_hotkey,
         COUNT(*) AS total_instances,
-        COALESCE(mbe.bounty_score, 0.0) AS bounty_score,
-        SUM(EXTRACT(EPOCH FROM (bi.billing_end - bi.billing_start))) AS compute_seconds,
-        SUM(EXTRACT(EPOCH FROM (bi.billing_end - bi.billing_start)) * bi.compute_multiplier) AS compute_units
-    FROM billed_instances bi
-    LEFT JOIN miner_bounty_effective mbe
-           ON mbe.miner_hotkey = bi.miner_hotkey
-    WHERE bi.billing_end > bi.billing_start
-    GROUP BY bi.miner_hotkey, mbe.bounty_score
+        COUNT(CASE WHEN iwc.bounty IS TRUE THEN 1 END) AS bounty_score,
+        SUM(EXTRACT(EPOCH FROM (iwc.billing_end - iwc.billing_start))) AS compute_seconds,
+        SUM(iwc.weighted_compute_units) AS compute_units
+    FROM instance_weighted_compute iwc
+    GROUP BY iwc.miner_hotkey
 )
 
 SELECT
@@ -393,7 +206,7 @@ SELECT
     total_instances,
     bounty_score,
     COALESCE(compute_seconds, 0) AS compute_seconds,
-    COALESCE(compute_units, 0)  AS compute_units
+    COALESCE(compute_units, 0) AS compute_units
 FROM miner_compute_units
 ORDER BY compute_units DESC
 """
@@ -413,105 +226,6 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
-
-
-@lru_cache(maxsize=1)
-def get_optimal_worker_count(ram_per_worker_gb=4):
-    """
-    Calculate how many workers to use for invocation processing, which is
-    basically just free RAM based (ensure each worker has 4GB).
-    """
-    mem = psutil.virtual_memory()
-    available_gb = mem.available / (1024**3)
-    max_workers_by_ram = int(available_gb / ram_per_worker_gb)
-    cpu_count = psutil.cpu_count(logical=True)
-    optimal_workers = max(1, min(max_workers_by_ram, cpu_count))
-    logger.info(f"System RAM: {mem.total / (1024**3):.1f}GB total, {available_gb:.1f}GB available")
-    logger.info(f"CPU cores: {cpu_count}")
-    logger.info(f"Optimal workers: {optimal_workers} (based on {ram_per_worker_gb}GB per worker)")
-    return optimal_workers
-
-
-def escape_for_copy(val):
-    """
-    Helper function to escape values for COPY format.
-    """
-    if val is None:
-        return "\\N"
-    if isinstance(val, (dict, list)):
-        import orjson
-
-        val = orjson.dumps(val).decode()
-    else:
-        val = str(val)
-    return val.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-
-
-def transform_invocation(row):
-    """
-    Transform a single invocation row.
-    """
-    row_data = dict(row)
-    row_data.update(
-        {
-            "miner_uid": int(row["miner_uid"]),
-            "compute_multiplier": float(row["compute_multiplier"]),
-            "bounty": int(row["bounty"]),
-            "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
-                tzinfo=None
-            ),
-        }
-    )
-    if row["completed_at"]:
-        row_data.update(
-            {
-                "completed_at": datetime.fromisoformat(row["completed_at"].rstrip("Z")).replace(
-                    tzinfo=None
-                )
-            }
-        )
-    else:
-        row_data["completed_at"] = None
-    for key in row_data:
-        if isinstance(row_data[key], str) and not row_data[key].strip():
-            row_data[key] = None
-    if row.get("metrics"):
-        try:
-            row_data["metrics"] = ast.literal_eval(row["metrics"])
-        except ValueError:
-            row_data["metrics"] = None
-    else:
-        row_data["metrics"] = None
-    return row_data
-
-
-def process_chunk(chunk):
-    """
-    Process a chunk of invocations.
-    """
-    return [transform_invocation(row) for row in chunk if int(row["miner_uid"]) >= 0]
-
-
-INVOCATION_COLS = [
-    "entry_id",
-    "parent_invocation_id",
-    "invocation_id",
-    "chute_id",
-    "chute_user_id",
-    "function_name",
-    "user_id",
-    "image_id",
-    "image_user_id",
-    "instance_id",
-    "miner_uid",
-    "miner_hotkey",
-    "error_message",
-    "compute_multiplier",
-    "bounty",
-    "metrics",
-    "started_at",
-    "completed_at",
-]
 
 
 class Report(Base):
@@ -650,6 +364,22 @@ class GPUCount(Base):
     gpu_count = Column(Integer)
 
 
+class InstanceComputeHistory(Base):
+    """
+    Tracks compute_multiplier changes over time for each instance.
+    Used for time-weighted scoring calculations.
+    """
+
+    __tablename__ = "instance_compute_history"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    instance_id = Column(String, nullable=False, index=True)
+    compute_multiplier = Column(Double, nullable=False)
+    started_at = Column(DateTime(timezone=False), nullable=False)
+    ended_at = Column(DateTime(timezone=False), nullable=True)
+
+    __table_args__ = (Index("idx_ich_instance_started", "instance_id", "started_at", unique=True),)
+
+
 class Auditor:
     def __init__(self, config_path: str = None):
         """
@@ -676,11 +406,10 @@ class Auditor:
                     image_config.dataset.name, **dict(image_config.dataset.options)
                 )
         self.validators = {v.hotkey: v for v in self.config.validators}
-        self._slock = asyncio.Lock()
-        self._asession = None
         self._running = True
         self.chutes = {}
-        self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
+        self.subtensor_url = self.config.subtensor
+        self.netuid = getattr(self.config, "netuid", 64)
 
         # Keypair -- only set if you are a registered validator.
         self.ss58_address = None
@@ -689,61 +418,42 @@ class Auditor:
             self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
 
-    @contextmanager
-    def substrate(self):
-        """
-        Yield the substrate interface, reconnecting on error.
-        """
-        try:
-            yield self._substrate
-        except Exception:
-            self._substrate = SubstrateInterface(url=self.config.subtensor, ss58_format=42)
-            raise
-
+    @staticmethod
     @asynccontextmanager
-    async def aiosession(self) -> aiohttp.ClientSession:
-        """
-        Get or create an aiohttp session.
-        """
-        async with self._slock:
-            if self._asession is None or self._asession.closed:
-                self._asession = aiohttp.ClientSession(
-                    connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=120, force_close=False),
-                    read_bufsize=64 * 1024 * 1024,
-                    raise_for_status=False,
-                    trust_env=True,
-                )
-            yield self._asession
+    async def aiosession():
+        """Create a fresh aiohttp session for each request."""
+        async with aiohttp.ClientSession() as session:
+            yield session
 
     async def sync_and_save_metagraph(self):
         """
         Sync metagraph to DB.
         """
-        with self.substrate() as substrate:
-            nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
+        async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+            nodes = await self._get_nodes_for_netuid(substrate, self.netuid)
         if not nodes:
             raise Exception("Failed to load metagraph nodes!")
         async with get_session() as session:
-            hotkeys = ", ".join([f"'{node.hotkey}'" for node in nodes])
+            hotkeys = ", ".join([f"'{node['hotkey']}'" for node in nodes])
             await session.execute(
                 text(
-                    f"DELETE FROM metagraph_nodes WHERE netuid = 64 AND hotkey NOT IN ({hotkeys}) AND node_id >= 0"
+                    f"DELETE FROM metagraph_nodes WHERE netuid = {self.netuid} AND hotkey NOT IN ({hotkeys}) AND node_id >= 0"
                 )
             )
             for node in nodes:
-                node_dict = node.dict()
+                node_dict = dict(node)
                 node_dict.pop("last_updated", None)
-                node_dict["checksum"] = hashlib.sha256(json.dumps(node_dict)).hexdigest()
+                node_dict["checksum"] = hashlib.sha256(
+                    jjson.dumps(node_dict, sort_keys=True).encode()
+                ).hexdigest()
                 statement = pg_insert(MetagraphNode).values(node_dict)
                 statement = statement.on_conflict_do_update(
                     index_elements=["hotkey"],
-                    set_={
-                        key: getattr(statement.excluded, key) for key, value in node_dict.items()
-                    },
+                    set_={key: getattr(statement.excluded, key) for key in node_dict.keys()},
                     where=MetagraphNode.checksum != node_dict["checksum"],
                 )
                 await session.execute(statement)
-            logger.info("Successfully synced metagraph nodes for netuid 64.")
+            logger.info(f"Successfully synced metagraph nodes for netuid {self.netuid}.")
             await session.commit()
 
     async def sync_gpu_counts(self):
@@ -764,10 +474,17 @@ class Auditor:
                     {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]},
                 )
             await session.commit()
+        logger.success("Synced chute GPU counts.")
 
     async def reconcile_instance_audit_deletions(self, conn):
         """
-        Backfill missing deleted_at values in instance_audits from the authoritative CSV feed.
+        Reconcile instance_audits from the authoritative CSV feed.
+
+        The reconciliation CSV represents the complete set of known instances from the
+        validator's perspective. This method:
+        1. Deletes any instance_audits records where the instance_id is not in the CSV
+           (stale/old records that no longer exist)
+        2. Updates deleted_at timestamps for remaining records based on the CSV
         """
         url = "https://api.chutes.ai/instances/reconciliation_csv"
         with open("reconciliation_data.csv", "w") as outfile:
@@ -775,10 +492,20 @@ class Auditor:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         logger.warning(
-                            f"Unable to fetch reconciliation csv ({resp.status}), skipping deleted_at backfill"
+                            f"Unable to fetch reconciliation csv ({resp.status}), skipping reconciliation"
                         )
                         return
-                    outfile.write(await resp.text())
+                    csv_content = await resp.text()
+                    outfile.write(csv_content)
+
+        # Safety check: ensure we have actual data (not just a header or empty response)
+        lines = csv_content.strip().split("\n")
+        if len(lines) < 2:
+            logger.error(
+                "Reconciliation CSV is empty or contains only headers, aborting to prevent data loss"
+            )
+            Path("reconciliation_data.csv").unlink(missing_ok=True)
+            return
 
         sql_script = """
 BEGIN;
@@ -788,19 +515,18 @@ CREATE TABLE IF NOT EXISTS tmp_instance_deletions (
 );
 TRUNCATE tmp_instance_deletions;
 \\copy tmp_instance_deletions (instance_id, deleted_at) FROM 'reconciliation_data.csv' WITH (FORMAT csv, HEADER true);
+
+-- Delete stale records: any instance_audits where instance_id is not in the reconciliation CSV
+DELETE FROM instance_audits
+WHERE instance_id NOT IN (SELECT instance_id FROM tmp_instance_deletions);
+
+-- Update deleted_at for remaining records based on the CSV
 UPDATE instance_audits ia
 SET deleted_at = tmp.deleted_at
 FROM tmp_instance_deletions tmp
 WHERE ia.instance_id = tmp.instance_id
   AND ia.deleted_at IS NULL
-  AND tmp.deleted_at IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1
-    FROM instance_audits ia_existing
-    WHERE ia_existing.instance_id = ia.instance_id
-      AND ia_existing.source = 'validator'
-      AND ia_existing.deleted_at IS NOT NULL
-  );
+  AND tmp.deleted_at IS NOT NULL;
 COMMIT;
 """
 
@@ -846,22 +572,83 @@ COMMIT;
             return
 
         stdout_text = stdout.decode().strip()
+        deleted_rows = 0
         updated_rows = 0
-        for line in reversed(stdout_text.splitlines()):
-            match = re.search(r"UPDATE (\\d+)", line)
-            if match:
-                updated_rows = int(match.group(1))
-                break
+        for line in stdout_text.splitlines():
+            delete_match = re.search(r"DELETE (\d+)", line)
+            update_match = re.search(r"UPDATE (\d+)", line)
+            if delete_match:
+                deleted_rows = int(delete_match.group(1))
+            if update_match:
+                updated_rows = int(update_match.group(1))
         logger.info(
-            f"Reconciled deleted_at for {updated_rows} instance_audits records via psql bulk import"
+            f"Reconciled instance_audits: deleted {deleted_rows} stale records, "
+            f"updated deleted_at for {updated_rows} records"
+        )
+
+    async def reconcile_instance_compute_history(self):
+        """
+        Full reconciliation of instance_compute_history by truncating and rebuilding
+        from the API's source of truth. This ensures consistency with the validator's
+        compute history data.
+        """
+        url = "https://api.chutes.ai/instances/compute_history_csv"
+        async with self.aiosession() as http_session:
+            async with http_session.get(url) as resp:
+                resp.raise_for_status()
+                csv_content = await resp.text()
+
+        lines = csv_content.strip().split("\n")
+        if len(lines) < 2:
+            logger.warning("No compute history records from API, skipping reconciliation")
+            return
+
+        reader = csv.DictReader(lines)
+        records = []
+        for row in reader:
+            started_at = datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(tzinfo=None)
+            ended_at = None
+            if row["ended_at"] and row["ended_at"].strip():
+                ended_at = datetime.fromisoformat(row["ended_at"].rstrip("Z")).replace(tzinfo=None)
+            records.append(
+                {
+                    "instance_id": row["instance_id"],
+                    "compute_multiplier": float(row["compute_multiplier"]),
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                }
+            )
+
+        if not records:
+            logger.warning("No compute history records from API, skipping reconciliation")
+            return
+
+        # Truncate and rebuild in a single transaction
+        async with get_session() as session:
+            await session.execute(text("TRUNCATE TABLE instance_compute_history"))
+            for batch_start in range(0, len(records), 500):
+                batch = records[batch_start : batch_start + 500]
+                for record in batch:
+                    await session.execute(
+                        text("""
+                            INSERT INTO instance_compute_history
+                                (instance_id, compute_multiplier, started_at, ended_at)
+                            VALUES (:instance_id, :compute_multiplier, :started_at, :ended_at)
+                        """),
+                        record,
+                    )
+            await session.commit()
+        logger.success(
+            f"Reconciled instance_compute_history: truncated and rebuilt with {len(records)} records"
         )
 
     async def reconcile_instance_audit(self):
         """
-        Standalone entrypoint for reconciling instance_audit deletions.
+        Standalone entrypoint for reconciling instance_audit deletions and compute history.
         """
         async with engine.begin() as conn:
             await self.reconcile_instance_audit_deletions(conn)
+        await self.reconcile_instance_compute_history()
 
     def get_random_image_payload(self, model: str):
         """
@@ -1267,42 +1054,57 @@ COMMIT;
             await session.commit()
         logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
 
-    @lru_cache(maxsize=1024)
-    def get_block_hash(self, block):
+    async def get_block_hash(self, substrate: AsyncSubstrateInterface, block: int) -> str:
         """
         Get a block (number) hash.
         """
-        with self.substrate() as substrate:
-            return substrate.get_block_hash(block)
+        return await substrate.get_block_hash(block)
 
-    def get_block_commit(self, block, who):
+    async def get_block_commit(
+        self, substrate: AsyncSubstrateInterface, block: int, who: str
+    ) -> str | None:
         """
         Given a block number, fetch all set_commitment events.
         """
         logger.info(f"Attempting to process {block=}")
-        with self.substrate() as substrate:
-            block_hash = self.get_block_hash(block)
-            commitment = substrate.query(
-                module="Commitments",
-                storage_function="CommitmentOf",
-                params=[64, who],
-                block_hash=block_hash,
-            )
-            if commitment:
-                for c in commitment.value.get("info", {}).get("fields"):
-                    if "Sha256" in c:
-                        return c["Sha256"][2:]
+        block_hash = await self.get_block_hash(substrate, block)
+        commitment = await substrate.query(
+            module="Commitments",
+            storage_function="CommitmentOf",
+            params=[self.netuid, who],
+            block_hash=block_hash,
+        )
+        if commitment:
+            value = commitment.value if hasattr(commitment, "value") else commitment
+            if value:
+                for field in value.get("info", {}).get("fields", []):
+                    # The substrate tuple encoding can wrap dicts/bytes in 1-item tuples.
+                    if isinstance(field, (list, tuple)) and len(field) == 1:
+                        field = field[0]
+                    if isinstance(field, dict) and "Sha256" in field:
+                        raw = field["Sha256"]
+                        if isinstance(raw, (list, tuple)) and len(raw) == 1:
+                            raw = raw[0]
+                        if isinstance(raw, (list, tuple)):
+                            try:
+                                return bytes(raw).hex()
+                            except (TypeError, ValueError):
+                                pass
+                        if isinstance(raw, (bytes, bytearray)):
+                            return bytes(raw).hex()
         logger.warning(f"Failed to get commit sha256 for {block=} from {who}")
         return None
 
-    def check_audit_report_integrity(self, record, path, content):
+    async def check_audit_report_integrity(
+        self, substrate: AsyncSubstrateInterface, record, path, content
+    ):
         """
         Check a single audit report's sha256 compared to the set_commitment call's checksum.
         """
         calculated = hashlib.sha256(content).hexdigest()
         committed = None
         try:
-            committed = self.get_block_commit(record.block, record.hotkey)
+            committed = await self.get_block_commit(substrate, record.block, record.hotkey)
         except Exception as exc:
             if "unknown Block: State already discarded" in str(exc):
                 logger.warning(
@@ -1311,10 +1113,8 @@ COMMIT;
                 return True
         if not committed:
             logger.warning(
-                f"Could not find commitment for hotkey {record.hotkey} on netuid 64 in block {record.block}"
+                f"Could not find commitment for hotkey {record.hotkey} on netuid {self.netuid} in block {record.block}"
             )
-            if record.hotkey in self.validators:
-                return False
             return True
         if committed != calculated:
             if record.hotkey in self.validators:
@@ -1438,93 +1238,78 @@ COMMIT;
             f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
             f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
         )
-        if db_record.hotkey in self.validators and not self.check_audit_report_integrity(
-            db_record, path, audit_content
-        ):
-            raise IntegrityViolation(
-                f"Commitment on chain does not match downloaded report! {db_record=}"
-            )
+        if db_record.hotkey in self.validators:
+            async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+                if not await self.check_audit_report_integrity(
+                    substrate, db_record, path, audit_content
+                ):
+                    raise IntegrityViolation(
+                        f"Commitment on chain does not match downloaded report! {db_record=}"
+                    )
         return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
-    async def load_invocations(self, csv_path: str, entry_id: str) -> int:
+    async def check_synthetics_in_csv(self, csv_path: str, db_record) -> None:
         """
-        Load (after transform) invocations from CSV export into Postgres.
+        Check if our local synthetics appear in the validator's invocation CSV export.
+        This validates that synthetic requests were properly tracked without loading
+        all invocation data into the database.
         """
-        logger.info(f"Loading invocation records to transform and load into DB from {csv_path}")
+        # Build a set of invocation_ids from the CSV for fast lookup
+        csv_invocation_ids = set()
+        csv_invocations_by_id = {}
         with open(csv_path, "r", newline="") as infile:
             reader = csv.DictReader(infile)
-            rows = []
             for row in reader:
-                row["entry_id"] = entry_id
-                rows.append(row)
-        if not rows:
-            logger.info("No rows to process")
-            return 0
+                inv_id = row.get("invocation_id")
+                if inv_id:
+                    csv_invocation_ids.add(inv_id)
+                    csv_invocations_by_id[inv_id] = row
 
-        logger.info(f"Read {len(rows)} rows from CSV, starting transformation...")
-        base_chunk_size = max(1, len(rows) // 100)
-        transform_chunks = [
-            rows[i : i + base_chunk_size] for i in range(0, len(rows), base_chunk_size)
-        ]
-        transformed_rows = []
-        with ProcessPoolExecutor(max_workers=get_optimal_worker_count()) as executor:
-            futures = [executor.submit(process_chunk, chunk) for chunk in transform_chunks]
-            for future in as_completed(futures):
-                try:
-                    transformed_rows.extend(future.result())
-                except Exception as e:
-                    logger.error(f"Chunk transformation failed: {e}")
-        if not transformed_rows:
-            logger.warning("No rows transformed")
-            return 0
+        # Get synthetics that should have been tracked by this validator's report
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT parent_invocation_id, invocation_id, instance_id,
+                           chute_id, miner_uid, miner_hotkey, created_at
+                    FROM synthetics
+                    WHERE created_at < :end_time
+                    """
+                ),
+                {"end_time": db_record.end_time},
+            )
+            synthetics = result.mappings().all()
 
-        logger.info(f"Transformation complete, {len(transformed_rows)} rows ready to load...")
-        timestamp = int(time.time() * 1000)
-        temp_csv_path = f"/tmp/invocations_load_{timestamp}.csv"
-        try:
-            with open(temp_csv_path, "w", newline="") as csvfile:
-                for row in transformed_rows:
-                    fields = [escape_for_copy(row.get(col)) for col in INVOCATION_COLS]
-                    csvfile.write("\t".join(fields) + "\n")
-            logger.info(f"Wrote {len(transformed_rows)} rows to temporary CSV: {temp_csv_path}")
-            part = f"inv_{entry_id.replace('-', '')}"
-            async with get_session() as session:
-                await session.execute(text(f"DROP TABLE IF EXISTS {part}"))
-                await session.execute(
-                    text(
-                        f"CREATE TABLE {part} PARTITION OF invocations FOR VALUES IN ('{entry_id}')"
-                    )
+        # Check each synthetic against the CSV
+        missing_count = 0
+        mismatched_count = 0
+        for synthetic in synthetics:
+            inv_id = synthetic["invocation_id"]
+            if inv_id not in csv_invocation_ids:
+                missing_count += 1
+                logger.warning(
+                    f"SYNTHETIC MISSING from CSV: invocation_id={inv_id} "
+                    f"instance_id={synthetic['instance_id']} "
+                    f"miner_hotkey={synthetic['miner_hotkey']}"
                 )
-                await session.commit()
-            cmd = [
-                "psql",
-                "-h",
-                POSTGRES_HOST,
-                "-p",
-                str(POSTGRES_PORT),
-                "-U",
-                POSTGRES_USER,
-                "-d",
-                POSTGRES_DB,
-                "-c",
-                f"\\copy {part} ({','.join(INVOCATION_COLS)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
-            ]
-            logger.info("Running psql COPY command...")
-            env = os.environ.copy()
-            env["PGPASSWORD"] = POSTGRES_PASSWORD
-            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            if result.returncode != 0:
-                logger.error(f"psql COPY failed: {result.stderr}")
-                raise Exception(f"psql COPY failed: {result.stderr}")
-            logger.info("Successfully copied data to invocations table!")
-            return len(transformed_rows)
-        except Exception as e:
-            logger.error(f"Failed to load invocations: {e}")
-            raise
-        finally:
-            if os.path.exists(temp_csv_path):
-                os.remove(temp_csv_path)
-                logger.debug(f"Cleaned up temporary CSV: {temp_csv_path}")
+            else:
+                # Check miner_hotkey matches
+                csv_row = csv_invocations_by_id.get(inv_id)
+                if csv_row and csv_row.get("miner_hotkey") != synthetic["miner_hotkey"]:
+                    mismatched_count += 1
+                    logger.warning(
+                        f"SYNTHETIC MINER MISMATCH: invocation_id={inv_id} "
+                        f"expected={synthetic['miner_hotkey']} "
+                        f"got={csv_row.get('miner_hotkey')}"
+                    )
+
+        if missing_count or mismatched_count:
+            logger.warning(
+                f"Synthetic validation: {missing_count} missing, {mismatched_count} mismatched "
+                f"out of {len(synthetics)} synthetics checked"
+            )
+        else:
+            logger.info(f"All {len(synthetics)} synthetics validated against CSV")
 
     async def load_reports(self, session, csv_path):
         """
@@ -1703,25 +1488,80 @@ COMMIT;
                 f"No self-reported chute metric records for {record.hotkey} in {record.entry_id=}"
             )
 
+    async def load_compute_history(self, audit_data):
+        """
+        Load compute_history records from validator audit data.
+        Uses upsert on (instance_id, started_at) to handle duplicates.
+        """
+        records = audit_data.get("compute_history", [])
+        if not records:
+            return
+
+        total = 0
+        for item in records:
+            try:
+                started_at = item["started_at"]
+                if isinstance(started_at, str):
+                    started_at = datetime.fromisoformat(started_at.rstrip("Z")).replace(tzinfo=None)
+                ended_at = item.get("ended_at")
+                if ended_at and isinstance(ended_at, str):
+                    ended_at = datetime.fromisoformat(ended_at.rstrip("Z")).replace(tzinfo=None)
+
+                async with get_session() as session:
+                    await session.execute(
+                        text("""
+                            INSERT INTO instance_compute_history
+                                (instance_id, compute_multiplier, started_at, ended_at)
+                            VALUES (:instance_id, :compute_multiplier, :started_at, :ended_at)
+                            ON CONFLICT (instance_id, started_at)
+                            DO UPDATE SET
+                                compute_multiplier = EXCLUDED.compute_multiplier,
+                                ended_at = EXCLUDED.ended_at
+                        """),
+                        {
+                            "instance_id": item["instance_id"],
+                            "compute_multiplier": float(item["compute_multiplier"]),
+                            "started_at": started_at,
+                            "ended_at": ended_at,
+                        },
+                    )
+                    await session.commit()
+                    total += 1
+            except Exception as exc:
+                logger.error(f"Error loading compute_history record: {exc} - {item}")
+        if total:
+            logger.success(f"Loaded {total} compute_history records")
+
+    @backoff.on_exception(backoff.constant, Exception, jitter=None, interval=10, max_tries=10)
+    async def _get_blacklisted_hotkeys(self) -> set[str]:
+        """Fetch blacklisted hotkeys from the API metagraph endpoint."""
+        async with self.aiosession() as session:
+            async with session.get("https://api.chutes.ai/miner/metagraph") as resp:
+                resp.raise_for_status()
+                nodes = await resp.json()
+                assert isinstance(nodes, list) and len(nodes) > 0, "Invalid metagraph response"
+                blacklisted = {n["hotkey"] for n in nodes if n.get("blacklist_reason")}
+                if blacklisted:
+                    logger.info(f"Found {len(blacklisted)} blacklisted miners to exclude")
+                return blacklisted
+
     async def get_weights_to_set(
         self,
         hotkeys_to_node_ids: Optional[dict[str, int]] = None,
     ) -> tuple[list[int], list[float]] | None:
         """
-        Get weights to set from the invocation data.
+        Compute miner scores based purely on compute_units (instance lifetime * compute_multiplier).
+        All bonuses (bounty age, urgency, TEE, private) are baked into compute_multiplier at activation.
         """
         if not hotkeys_to_node_ids:
-            with self.substrate() as substrate:
-                all_nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
-                hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
+            async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+                all_nodes = await self._get_nodes_for_netuid(substrate, self.netuid)
+                hotkeys_to_node_ids = {node["hotkey"]: node["node_id"] for node in all_nodes}
 
-        compute_query = text(NORMALIZED_COMPUTE_QUERY.format(interval=SCORING_INTERVAL))
-        inventory_query = text(INVENTORY_QUERY.format(interval=SCORING_INTERVAL))
-        instances_query = text(
-            INSTANCES_QUERY.format(
-                interval=SCORING_INTERVAL, bounty_decay=BOUNTY_DECAY, bounty_rho=BOUNTY_RHO
-            )
-        )
+        # Fetch blacklisted hotkeys from the API
+        blacklisted_hotkeys = await self._get_blacklisted_hotkeys()
+
+        instances_query = text(INSTANCES_QUERY.format(interval=SCORING_INTERVAL))
 
         # Load active miners from metagraph (and map coldkey pairings to de-dupe multi-hotkey miners).
         raw_values = {}
@@ -1739,9 +1579,7 @@ COMMIT;
             }
 
         # Base score - instances active during the scoring period.
-        logger.info(
-            "Fetching base score values based on active instances during scoring interval..."
-        )
+        logger.info("Fetching scores based on active instances during scoring interval...")
         async with get_session() as session:
             instances_result = await session.execute(instances_query)
             for (
@@ -1751,166 +1589,56 @@ COMMIT;
                 instance_seconds,
                 instance_compute_units,
             ) in instances_result:
-                if not hotkey or hotkey not in hot_cold_map:
+                if not hotkey or hotkey not in hot_cold_map or hotkey in blacklisted_hotkeys:
                     continue
                 raw_values[hotkey] = {
                     "total_instances": float(total_instances or 0.0),
                     "bounty_score": float(bounty_score or 0.0),
                     "instance_seconds": float(instance_seconds or 0.0),
                     "instance_compute_units": float(instance_compute_units or 0.0),
-                    "invocation_compute_units": 0.0,
-                    "invocation_count": 0.0,
-                    "unique_chute_gpus": 0.0,
                 }
 
-        # Get the invocation metrics to calculate boosts for "demand"
-        logger.info("Fetching invocation metrics to calculate demand boost...")
-        async with get_session() as session:
-            compute_result = await session.execute(compute_query)
-            for hotkey, count, compute_units in compute_result:
-                if hotkey not in raw_values:
-                    continue
-                raw_values[hotkey]["invocation_compute_units"] = float(compute_units or 0.0)
-                raw_values[hotkey]["invocation_count"] = count
-
-        # Get the unique chute ("breadth" bonus) data.
-        logger.info("Fetching unique chute GPU score to calculate breadth bonus...")
-        async with get_session() as session:
-            unique_result = await session.execute(inventory_query)
-            for hotkey, unique_chute_gpus, total_active_gpus in unique_result:
-                if hotkey not in raw_values:
-                    continue
-                raw_values[hotkey]["unique_chute_gpus"] = float(unique_chute_gpus or 0.0)
-
-        # Build base scores from instance compute units.
-        base_scores = {hk: data["instance_compute_units"] for hk, data in raw_values.items()}
+        # Build scores from instance compute units.
+        scores = {hk: data["instance_compute_units"] for hk, data in raw_values.items()}
 
         # Purge multi-hotkey miners - keep only the highest scoring hotkey per coldkey
         hotkeys_to_remove = set()
         for coldkey in set(hot_cold_map.values()):
             if coldkey_counts.get(coldkey, 0) > 1:
                 coldkey_hotkeys = [
-                    hk for hk, ck in hot_cold_map.items() if ck == coldkey and hk in base_scores
+                    hk for hk, ck in hot_cold_map.items() if ck == coldkey and hk in scores
                 ]
                 if len(coldkey_hotkeys) > 1:
-                    coldkey_hotkeys.sort(key=lambda hk: base_scores.get(hk, 0.0), reverse=True)
+                    coldkey_hotkeys.sort(key=lambda hk: scores.get(hk, 0.0), reverse=True)
                     hotkeys_to_remove.update(coldkey_hotkeys[1:])
 
         for hotkey in hotkeys_to_remove:
-            base_scores.pop(hotkey, None)
+            scores.pop(hotkey, None)
             raw_values.pop(hotkey, None)
             logger.warning(f"Purging hotkey from multi-uid miner: {hotkey=}")
 
-        # Helpers
-        def minmax_then_exp_to_dist(values_map: dict[str, float], exp: float) -> dict[str, float]:
-            """
-            Min-max to [0,1], raise to 'exp', then sum-normalize to a distribution.
-            Returns a dict that sums to 1 across keys (unless empty).
-            """
-            if not values_map:
-                return {}
-            vals = list(values_map.values())
-            vmin, vmax = min(vals), max(vals)
-            rng = max(vmax - vmin, 1e-12)
-
-            powered = {k: ((v - vmin) / rng) ** exp for k, v in values_map.items()}
-            S = sum(powered.values())
-            if S <= 0:
-                # uniform fallback
-                n = len(powered)
-                return {k: 1.0 / n for k in powered}
-            return {k: powered[k] / S for k in powered}
-
-        def category_from_raw(raw_key: str) -> dict[str, float]:
-            return {hk: raw_values[hk].get(raw_key, 0.0) for hk in raw_values.keys()}
-
-        base_sum = sum(max(0.0, v) for v in base_scores.values())
-        base_dist = {}
-        if base_sum > 0:
-            base_dist = {hk: max(0.0, v) / base_sum for hk, v in base_scores.items()}
+        # Normalize to distribution.
+        score_sum = sum(max(0.0, v) for v in scores.values())
+        if score_sum > 0:
+            final_scores = {hk: max(0.0, v) / score_sum for hk, v in scores.items()}
         else:
-            n = max(len(base_scores), 1)
-            base_dist = {hk: 1.0 / n for hk in base_scores.keys()}
+            n = max(len(scores), 1)
+            final_scores = {hk: 1.0 / n for hk in scores.keys()}
 
-        base_weight = 1.0 - BONUS_WEIGHT
-        base_contrib = {hk: base_weight * base_dist.get(hk, 0.0) for hk in raw_values.keys()}
-
-        logger.info("Computing bonus distributions...")
-
-        # Category raw maps
-        breadth_raw = category_from_raw("unique_chute_gpus")
-        invoc_compute_raw = category_from_raw("invocation_compute_units")
-        invoc_count_raw = category_from_raw("invocation_count")
-        bounty_raw = category_from_raw("bounty_score")
-
-        # Demand raw is a weighted mix of invoc compute & count (still per-miner raw before dist)
-        demand_raw = {}
-        for hk in raw_values.keys():
-            dcw = float(DEMAND_COMPUTE_WEIGHT)
-            dnw = float(DEMAND_COUNT_WEIGHT)
-            ws = max(dcw + dnw, 1e-12)
-            demand_raw[hk] = (
-                dcw * invoc_compute_raw.get(hk, 0.0) + dnw * invoc_count_raw.get(hk, 0.0)
-            ) / ws
-
-        # Turn each category into a distribution via min-max → exp → sum-normalize
-        breadth_dist = minmax_then_exp_to_dist(breadth_raw, BONUS_EXP)
-        demand_dist = minmax_then_exp_to_dist(demand_raw, BONUS_EXP)
-        bounty_dist = minmax_then_exp_to_dist(bounty_raw, BONUS_EXP)
-
-        # Normalize BONUS weights across the categories that we’re actually using.
-        w_breadth = float(BONUS.get("breadth", 0.0))
-        w_demand = float(BONUS.get("demand", 0.0))
-        w_bounty = float(BONUS.get("bounty", 0.0))
-        W = max(w_breadth + w_demand + w_bounty, 1e-12)
-        wb, wd, wbo = w_breadth / W, w_demand / W, w_bounty / W
-
-        # Blend category distributions into a single bonus distribution and scale by bonus weight.
-        blended_bonus_dist = {}
-        for hk in raw_values.keys():
-            blended_bonus_dist[hk] = (
-                wb * breadth_dist.get(hk, 0.0)
-                + wd * demand_dist.get(hk, 0.0)
-                + wbo * bounty_dist.get(hk, 0.0)
-            )
-        bonus_weight = BONUS_WEIGHT
-        bonus_contrib = {
-            hk: bonus_weight * blended_bonus_dist.get(hk, 0.0) for hk in raw_values.keys()
-        }
-
-        final_scores = {
-            hk: base_contrib.get(hk, 0.0) + bonus_contrib.get(hk, 0.0) for hk in raw_values.keys()
-        }
         sorted_hotkeys = sorted(final_scores.keys(), key=lambda k: final_scores[k], reverse=True)
         logger.info(
-            f"{'#':<3} "
-            f"{'Hotkey':<48} "
-            f"{'Score':<10} "
-            f"{'Base':<10} "
-            f"{'Breadth':<10} "
-            f"{'Demand':<10} "
-            f"{'Bounty':<10}"
+            f"{'#':<3} {'Hotkey':<48} {'Score':<10} {'Instances':<10} {'Seconds':<12} {'Compute':<12}"
         )
-        logger.info("-" * 120)
+        logger.info("-" * 100)
         for rank, hotkey in enumerate(sorted_hotkeys, 1):
-            b_total = bonus_contrib.get(hotkey, 0.0)
-            eps = 1e-12
-            cat_share = (
-                wb * breadth_dist.get(hotkey, 0.0)
-                + wd * demand_dist.get(hotkey, 0.0)
-                + wbo * bounty_dist.get(hotkey, 0.0)
-            ) + eps
-            breadth_c = b_total * (wb * breadth_dist.get(hotkey, 0.0)) / cat_share
-            demand_c = b_total * (wd * demand_dist.get(hotkey, 0.0)) / cat_share
-            bounty_c = b_total * (wbo * bounty_dist.get(hotkey, 0.0)) / cat_share
+            data = raw_values.get(hotkey, {})
             logger.info(
                 f"{rank:<3} "
                 f"{hotkey:<48} "
                 f"{final_scores[hotkey]:<10.6f} "
-                f"{base_contrib.get(hotkey, 0.0):<10.6f} "
-                f"{breadth_c:<10.6f} "
-                f"{demand_c:<10.6f} "
-                f"{bounty_c:<10.6f} "
+                f"{int(data.get('total_instances', 0)):<10} "
+                f"{int(data.get('instance_seconds', 0)):<12} "
+                f"{int(data.get('instance_compute_units', 0)):<12}"
             )
 
         # Final weights per node.
@@ -1925,6 +1653,82 @@ COMMIT;
 
         return node_ids, node_weights
 
+    @staticmethod
+    def _normalize_and_quantize_weights(
+        node_ids: list[int], node_weights: list[float]
+    ) -> tuple[list[int], list[int]]:
+        """
+        Normalize weights to sum to 1, then quantize to U16 values.
+        """
+        U16_MAX = 65535
+        if not node_weights:
+            return [], []
+
+        total = sum(node_weights)
+        if total <= 0:
+            return node_ids, [0] * len(node_weights)
+
+        # Normalize and quantize to U16
+        normalized = [w / total for w in node_weights]
+        quantized = [min(int(w * U16_MAX), U16_MAX) for w in normalized]
+
+        # Filter out zero weights
+        filtered_ids = []
+        filtered_weights = []
+        for nid, w in zip(node_ids, quantized):
+            if w > 0:
+                filtered_ids.append(nid)
+                filtered_weights.append(w)
+
+        return filtered_ids, filtered_weights
+
+    async def _get_nodes_for_netuid(
+        self, substrate: AsyncSubstrateInterface, netuid: int
+    ) -> list[dict]:
+        """
+        Fetch all nodes for a given netuid using the SubnetInfoRuntimeApi.
+        """
+        from scalecodec.utils.ss58 import ss58_encode
+
+        def _ss58_encode(address, ss58_format: int = 42) -> str:
+            if isinstance(address, str):
+                return address
+            if isinstance(address, (list, tuple)) and len(address) > 0:
+                if not isinstance(address[0], int):
+                    address = address[0]
+            return ss58_encode(bytes(address).hex(), ss58_format)
+
+        response = await substrate.runtime_call(
+            api="SubnetInfoRuntimeApi",
+            method="get_metagraph",
+            params=[netuid],
+        )
+        metagraph = response if isinstance(response, dict) else response.value
+
+        nodes = []
+        for uid in range(len(metagraph["hotkeys"])):
+            axon = metagraph["axons"][uid]
+            nodes.append(
+                {
+                    "hotkey": _ss58_encode(metagraph["hotkeys"][uid]),
+                    "coldkey": _ss58_encode(metagraph["coldkeys"][uid]),
+                    "node_id": uid,
+                    "netuid": metagraph["netuid"],
+                    "incentive": metagraph["incentives"][uid],
+                    "alpha_stake": metagraph["alpha_stake"][uid] * 10**-9,
+                    "tao_stake": metagraph["tao_stake"][uid] * 10**-9,
+                    "stake": metagraph["total_stake"][uid] * 10**-9,
+                    "trust": 0,
+                    "vtrust": metagraph["consensus"][uid],
+                    "last_updated": float(metagraph["last_update"][uid]),
+                    "ip": str(axon["ip"]),
+                    "ip_type": axon["ip_type"],
+                    "port": axon["port"],
+                    "protocol": axon["protocol"],
+                }
+            )
+        return nodes
+
     async def get_and_set_weights(self):
         """
         When enabled, and you have a validator registered on the subnet, calculate and set weights from audit data.
@@ -1933,35 +1737,39 @@ COMMIT;
             logger.warning("Refusing to attempt setting weights, not enabled in config!")
             return False
 
-        with self.substrate() as substrate:
-            substrate, uid = query_substrate(
-                substrate, "SubtensorModule", "Uids", [64, self.ss58_address], return_value=True
+        async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+            # Get validator UID
+            uid_result = await substrate.query(
+                module="SubtensorModule",
+                storage_function="Uids",
+                params=[self.netuid, self.ss58_address],
             )
-            if not uid:
+            uid = uid_result.value if hasattr(uid_result, "value") else uid_result
+            if uid is None:
                 logger.warning(
                     "Validator node id not found on the metagraph, are you sure "
-                    f"hotkey {self.ss58_address} is registered on subnet 64?"
+                    f"hotkey {self.ss58_address} is registered on subnet {self.netuid}?"
                 )
                 return False
 
             # Load the nodes from the metagraph.
-            all_nodes: list[Node] = fetch_nodes.get_nodes_for_netuid(substrate, 64)
-            hotkeys_to_node_ids = {node.hotkey: node.node_id for node in all_nodes}
+            all_nodes = await self._get_nodes_for_netuid(substrate, self.netuid)
+            hotkeys_to_node_ids = {node["hotkey"]: node["node_id"] for node in all_nodes}
 
             # Query the audit data for weights to set.
             result = await self.get_weights_to_set(hotkeys_to_node_ids)
             if result is None:
                 logger.warning("No weights to set. Skipping weight setting.")
-                return
+                return False
             node_ids, node_weights = result
             if len(node_ids) == 0:
                 logger.warning("No nodes to set weights for. Skipping weight setting.")
                 return False
-            self.compare_weights_to_actual(result)
+            await self.compare_weights_to_actual(result)
 
             # Set weights!
             logger.info("Weights calculated, about to set...")
-            all_node_ids = [node.node_id for node in all_nodes]
+            all_node_ids = [node["node_id"] for node in all_nodes]
             all_node_weights = [0.0 for _ in all_nodes]
             for node_id, node_weight in zip(node_ids, node_weights):
                 all_node_weights[node_id] = node_weight
@@ -1971,22 +1779,38 @@ COMMIT;
             logger.info(
                 f"Number of non zero node weights: {sum(1 for weight in all_node_weights if weight != 0)}"
             )
+
+            # Normalize and quantize weights
+            quantized_ids, quantized_weights = self._normalize_and_quantize_weights(
+                all_node_ids, all_node_weights
+            )
+
             try:
-                success = weights.set_node_weights(
-                    substrate=substrate,
-                    keypair=self.keypair,
-                    node_ids=all_node_ids,
-                    node_weights=all_node_weights,
-                    netuid=64,
-                    version_key=VERSION_KEY,
-                    validator_node_id=int(uid),
-                    wait_for_inclusion=False,
-                    wait_for_finalization=False,
-                    max_attempts=3,
+                call = await substrate.compose_call(
+                    call_module="SubtensorModule",
+                    call_function="set_weights",
+                    call_params={
+                        "dests": quantized_ids,
+                        "weights": quantized_weights,
+                        "netuid": self.netuid,
+                        "version_key": VERSION_KEY,
+                    },
                 )
+                extrinsic = await substrate.create_signed_extrinsic(
+                    call=call,
+                    keypair=self.keypair,
+                    era={"period": 5},
+                )
+                receipt = await substrate.submit_extrinsic(
+                    extrinsic,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                )
+                success = await receipt.is_success
             except Exception as e:
                 logger.error(f"Failed to set weights: {e}")
                 return False
+
             if success:
                 logger.info("Weights set successfully.")
                 return True
@@ -1998,10 +1822,12 @@ COMMIT;
         """
         Fetch and verify all audit reports, returning the number of new reports from validators.
         """
+        logger.info("Checking for new audit report data...")
         async with self.aiosession() as session:
             async with session.get("https://api.chutes.ai/audit/") as resp:
                 audit_records = await resp.json()
                 by_id = {record["entry_id"]: record for record in audit_records}
+        logger.info("Fetched audit data list.")
 
         # Clean up the old data, plus get a list of existing items to skip.
         delete_directories = []
@@ -2014,14 +1840,24 @@ COMMIT;
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
+                logger.info(f"Purging old audit entry: {entry.entry_id}")
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
-                await session.execute(
-                    text(f"DROP TABLE IF EXISTS inv_{entry.entry_id.replace('-', '')}")
-                )
+            logger.info("Purging old synthetics...")
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
+            logger.info("Purging old compute history data...")
+            await session.execute(
+                text(
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '169 hours'"
+                )
+            )
+            logger.info("Comitting...")
+            await session.commit()
+            logger.success("Session committed!")
+
+            logger.info("Collecting existing entry IDs...")
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
@@ -2077,15 +1913,20 @@ COMMIT;
                 logger.success(
                     f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}"
                 )
-                # Load CSV invocation data if it's from a validator.
+                # Check synthetics against invocation CSV if it's from a validator.
                 if inv_csv_path:
-                    if await self.load_invocations(inv_csv_path, db_record.entry_id):
-                        await session.execute(
-                            text(
-                                "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
-                            ),
-                            {"entry_id": db_record.entry_id},
-                        )
+                    await self.check_synthetics_in_csv(inv_csv_path, db_record)
+                    # Delete synthetics that have been validated
+                    await session.execute(
+                        text("DELETE FROM synthetics WHERE created_at < :end_time"),
+                        {"end_time": db_record.end_time},
+                    )
+                    await session.execute(
+                        text(
+                            "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
+                        ),
+                        {"entry_id": db_record.entry_id},
+                    )
 
                 # Load reports CSV.
                 if reports_csv_path:
@@ -2097,6 +1938,10 @@ COMMIT;
 
                 # Persist the actual audit entry data.
                 await self.load_audit_entries(db_record, audit_data)
+
+                # Load compute_history from validator reports.
+                if db_record.hotkey in self.validators:
+                    await self.load_compute_history(audit_data)
 
                 # Load miner-reported metrics.
                 if db_record.hotkey not in self.validators:
@@ -2114,56 +1959,41 @@ COMMIT;
 
         if validator_total > 0:
             logger.info(
-                f"Reconciling instance audit deletions after processing {validator_total} new validator records..."
+                f"Reconciling instance data after processing {validator_total} new validator records..."
             )
             async with engine.begin() as conn:
                 await self.reconcile_instance_audit_deletions(conn)
+            await self.reconcile_instance_compute_history()
 
         return validator_total
 
     async def send_and_verify_synthetics(self):
         """
-        Continuously send small quantities of synthetic requests and ensure they appear in audit data.
+        Continuously send synthetic requests. Verification is done via check_synthetics_in_csv
+        when processing validator audit CSV exports.
         """
         while self._running and self.config.synthetics.enabled:
-            # Check if any of the synthetics did not appear in the audit invocation data,
-            # or if the miner hotkey doesn't match, etc.
-            async with get_session() as session:
-                # XXX the assumption here is that the `validators` configured in the system is a list containing exactly one, the chutes vali.
-                results = (
-                    (
-                        await session.execute(
-                            text(MISSING_INVOCATIONS_QUERY.format(hotkey=list(self.validators)[0]))
-                        )
-                    )
-                    .mappings()
-                    .all()
-                )
-                for row in results:
-                    message = "SYNTHETIC IS MISSING!\n\t" + "\n\t".join(
-                        [f"{key}: {value}" for key, value in dict(row).items()]
-                    )
-                    logger.warning(message)
-
-            # Send another.
             await self.perform_synthetic()
             await asyncio.sleep(60)
 
-    def compare_weights_to_actual(self, weights_tuple):
+    async def compare_weights_to_actual(self, weights_tuple):
         """
         Compare the weights we calculated to those in the metagraph.
         """
         uids, weights = weights_tuple
         weight_map = dict(zip(uids, weights))
-        with self.substrate() as substrate:
-            nodes = fetch_nodes.get_nodes_for_netuid(substrate, 64)
-        incentive_sum = sum([node.incentive for node in nodes])
+        async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+            nodes = await self._get_nodes_for_netuid(substrate, self.netuid)
+        incentive_sum = sum([node["incentive"] for node in nodes])
+        if incentive_sum == 0:
+            logger.warning("No incentive data in metagraph, skipping comparison.")
+            return
         for node in nodes:
-            expected = weight_map.get(node.node_id, 0.0)
-            actual = node.incentive / incentive_sum
+            expected = weight_map.get(node["node_id"], 0.0)
+            actual = node["incentive"] / incentive_sum
             if expected and actual:
                 delta = abs(expected - actual)
-                message = f"Calculated incentive locally for {node.hotkey} [{node.node_id:3d}]: {expected:.5f} vs actual {actual:.5f}, delta {delta:.5f}"
+                message = f"Calculated incentive locally for {node['hotkey']} [{node['node_id']:3d}]: {expected:.5f} vs actual {actual:.5f}, delta {delta:.5f}"
                 if delta <= 0.03:
                     logger.success(message)
                 else:
@@ -2171,52 +2001,162 @@ COMMIT;
 
     async def compare_miner_metrics(self):
         """
-        Check the miner reported metric data against the validator reported data.
+        Compare miner-reported instance data against validator-reported instance data.
+        For each (instance_id, miner_hotkey) pair, we get the "latest" record from each source
+        and compare key fields that affect scoring.
+
+        Keying on both instance_id and miner_hotkey prevents a malicious miner from
+        claiming instances that belong to other miners.
         """
         async with get_session() as session:
-            # Check how much coverage the miner has.
-            hotkeys = (
-                (await session.execute(text("SELECT DISTINCT(miner_hotkey) FROM invocations")))
-                .scalars()
-                .all()
-            )
-            logger.info("Checking audit data coverage for each miner with any invocations...")
-            for hotkey in hotkeys:
-                coverages = (
-                    (await session.execute(text(MINER_COVERAGE_QUERY.format(hotkey=hotkey))))
-                    .scalars()
-                    .all()
+            # Get latest record per (instance_id, miner_hotkey) from each source, then compare
+            comparison_query = text("""
+                WITH miner_latest AS (
+                    SELECT DISTINCT ON (instance_id, miner_hotkey)
+                        instance_id,
+                        miner_hotkey,
+                        created_at,
+                        activated_at,
+                        deleted_at,
+                        compute_multiplier
+                    FROM instance_audits
+                    WHERE source = 'miner'
+                    ORDER BY instance_id, miner_hotkey, deleted_at DESC NULLS LAST, created_at DESC
+                ),
+                validator_latest AS (
+                    SELECT DISTINCT ON (instance_id, miner_hotkey)
+                        instance_id,
+                        miner_hotkey,
+                        created_at,
+                        activated_at,
+                        deleted_at,
+                        compute_multiplier
+                    FROM instance_audits
+                    WHERE source = 'validator'
+                    ORDER BY instance_id, miner_hotkey, deleted_at DESC NULLS LAST, verified_at DESC NULLS LAST, created_at DESC
                 )
-                for coverage_seconds in coverages:
-                    if coverage_seconds != EXPECTED_COVERAGE:
-                        logger.warning(
-                            f"Miner {hotkey} is missing some audit report data: expecting {EXPECTED_COVERAGE} seconds but have {coverage_seconds}"
-                        )
-                    else:
-                        logger.success(
-                            f"Miner {hotkey} has full audit report coverage [{EXPECTED_COVERAGE} seconds]"
-                        )
+                SELECT
+                    COALESCE(m.instance_id, v.instance_id) as instance_id,
+                    COALESCE(m.miner_hotkey, v.miner_hotkey) as miner_hotkey,
+                    m.created_at as m_created,
+                    v.created_at as v_created,
+                    m.activated_at as m_activated,
+                    v.activated_at as v_activated,
+                    m.deleted_at as m_deleted,
+                    v.deleted_at as v_deleted,
+                    m.compute_multiplier as m_multiplier,
+                    v.compute_multiplier as v_multiplier,
+                    CASE WHEN m.instance_id IS NULL THEN 'miner_missing'
+                         WHEN v.instance_id IS NULL THEN 'validator_missing'
+                         ELSE 'both' END as presence
+                FROM miner_latest m
+                FULL OUTER JOIN validator_latest v
+                    ON m.instance_id = v.instance_id AND m.miner_hotkey = v.miner_hotkey
+                WHERE COALESCE(m.created_at, v.created_at) >= NOW() - INTERVAL '7 days'
+                ORDER BY COALESCE(m.miner_hotkey, v.miner_hotkey), COALESCE(m.created_at, v.created_at) DESC
+            """)
 
-            # Compare prometheus metrics first.
-            if os.getenv("CALCULATE_MINER_AGREEMENT", "false").lower() == "true":
-                logger.info("Calculating miner agreement ratio...")
-                metrics = (await session.execute(text(MINER_SUMMARY_METRICS_QUERY))).all()
-                logger.info(
-                    "Discrepancies here are somewhat expected, because miner metrics are from ephemeral prometheus metric queries, and not particularly accurate."
+            results = (await session.execute(comparison_query)).mappings().all()
+            if not results:
+                logger.info("No instance audit data to compare")
+                return
+
+            # Aggregate discrepancies by miner
+            miner_stats = {}
+            for row in results:
+                hotkey = row["miner_hotkey"]
+                if hotkey not in miner_stats:
+                    miner_stats[hotkey] = {
+                        "total": 0,
+                        "miner_only": 0,
+                        "validator_only": 0,
+                        "both": 0,
+                        "timestamp_mismatches": 0,
+                        "multiplier_mismatches": 0,
+                        "miner_seconds": 0.0,
+                        "validator_seconds": 0.0,
+                    }
+
+                stats = miner_stats[hotkey]
+                stats["total"] += 1
+
+                now = datetime.utcnow()
+                if row["presence"] == "miner_missing":
+                    stats["validator_only"] += 1
+                    if row["v_activated"]:
+                        v_end = row["v_deleted"] or now
+                        stats["validator_seconds"] += (v_end - row["v_activated"]).total_seconds()
+                elif row["presence"] == "validator_missing":
+                    stats["miner_only"] += 1
+                    if row["m_activated"]:
+                        m_end = row["m_deleted"] or now
+                        stats["miner_seconds"] += (m_end - row["m_activated"]).total_seconds()
+                else:
+                    stats["both"] += 1
+
+                    # Calculate seconds for both
+                    if row["m_activated"]:
+                        m_end = row["m_deleted"] or now
+                        stats["miner_seconds"] += (m_end - row["m_activated"]).total_seconds()
+                    if row["v_activated"]:
+                        v_end = row["v_deleted"] or now
+                        stats["validator_seconds"] += (v_end - row["v_activated"]).total_seconds()
+
+                    # Check for timestamp discrepancies (allowing 5 min tolerance)
+                    tolerance = timedelta(minutes=5)
+                    if row["m_created"] and row["v_created"]:
+                        if abs(row["m_created"] - row["v_created"]) > tolerance:
+                            stats["timestamp_mismatches"] += 1
+                    if row["m_activated"] and row["v_activated"]:
+                        if abs(row["m_activated"] - row["v_activated"]) > tolerance:
+                            stats["timestamp_mismatches"] += 1
+                    # deleted_at can legitimately differ if miner hasn't seen deletion yet
+                    if row["m_deleted"] and row["v_deleted"]:
+                        if abs(row["m_deleted"] - row["v_deleted"]) > tolerance:
+                            stats["timestamp_mismatches"] += 1
+
+                    # Check compute_multiplier match
+                    m_mult = row["m_multiplier"] or 1.0
+                    v_mult = row["v_multiplier"] or 1.0
+                    if abs(m_mult - v_mult) > 0.01:
+                        stats["multiplier_mismatches"] += 1
+
+            # Log summary per miner
+            logger.info("Instance audit comparison (miner vs validator) - last 7 days:")
+            logger.info(
+                f"{'Hotkey':<20} {'Total':>6} {'Both':>6} {'M-Only':>7} {'V-Only':>7} "
+                f"{'TsMis':>6} {'MulMis':>7} {'M-Secs':>12} {'V-Secs':>12} {'Ratio':>6}"
+            )
+            logger.info("-" * 110)
+
+            for hotkey in sorted(
+                miner_stats.keys(),
+                key=lambda h: miner_stats[h]["validator_seconds"],
+                reverse=True,
+            ):
+                s = miner_stats[hotkey]
+                if s["total"] == 0:
+                    continue
+
+                # Compute agreement ratio based on seconds
+                max_secs = max(s["miner_seconds"], s["validator_seconds"], 1.0)
+                min_secs = min(s["miner_seconds"], s["validator_seconds"])
+                ratio = min_secs / max_secs
+
+                line = (
+                    f"{hotkey[:20]:<20} {s['total']:>6} {s['both']:>6} {s['miner_only']:>7} "
+                    f"{s['validator_only']:>7} {s['timestamp_mismatches']:>6} "
+                    f"{s['multiplier_mismatches']:>7} {int(s['miner_seconds']):>12} "
+                    f"{int(s['validator_seconds']):>12} {ratio:>6.2f}"
                 )
-                for row in metrics:
-                    hotkey, audit_count, reported_count = row
-                    if not audit_count or not reported_count:
-                        logger.warning(f"Miner {hotkey} has no reported metrics...")
-                        continue
-                    ratio = min([audit_count, reported_count]) / (
-                        max([audit_count, reported_count]) or 1.0
-                    )
-                    message = f"Miner {hotkey} reported {reported_count} vs audit {audit_count}: agreement ratio {ratio:.4f}"
-                    if ratio < 0.9:
-                        logger.warning(message)
-                    else:
-                        logger.success(message)
+
+                # Flag miners with significant discrepancies
+                if s["validator_only"] > s["total"] * 0.1 or ratio < 0.8:
+                    logger.warning(line)
+                elif s["miner_only"] > s["total"] * 0.1:
+                    logger.warning(line + " (miner reporting instances validator doesn't see)")
+                else:
+                    logger.info(line)
 
     async def _verify_integrity(self):
         """
@@ -2249,14 +2189,14 @@ COMMIT;
                         "No new audit data, but here is the most recent weight data output from the "
                         f"report spanning {most_recent.start_time} through {most_recent.end_time}"
                     )
-                    self.compare_weights_to_actual(await self.get_weights_to_set())
+                    await self.compare_weights_to_actual(await self.get_weights_to_set())
                     await self.compare_miner_metrics()
             else:
                 if self.config.set_weights.enabled:
                     await self.get_and_set_weights()
                 else:
                     # If we aren't setting weights, we can at least examine them.
-                    self.compare_weights_to_actual(await self.get_weights_to_set())
+                    await self.compare_weights_to_actual(await self.get_weights_to_set())
 
                 # Compare the validator stats to miner self-reported stats.
                 await self.compare_miner_metrics()
@@ -2351,62 +2291,13 @@ COMMIT;
         Main loop, to do all the things.
         """
         async with engine.begin() as conn:
-            await conn.execute(
-                text("""
-                DO $$
-                DECLARE
-                    is_partitioned BOOLEAN;
-                BEGIN
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM pg_class c
-                        WHERE c.relname = 'invocations'
-                        AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
-                        AND c.relkind = 'r'
-                    ) INTO is_partitioned;
-                    IF is_partitioned THEN
-                        DROP TABLE invocations;
-                        RAISE NOTICE 'Dropped non-partitioned table invocations';
-                    ELSE
-                        RAISE NOTICE 'Table invocations does not exist or is partitioned, skipping drop';
-                    END IF;
-                END $$;
-                """)
-            )
-            await conn.execute(
-                text("""
-                CREATE TABLE IF NOT EXISTS invocations (
-                    entry_id text not null,
-                    parent_invocation_id character varying,
-                    invocation_id character varying NOT NULL,
-                    chute_id character varying,
-                    chute_user_id character varying,
-                    function_name character varying,
-                    user_id character varying,
-                    image_id character varying,
-                    image_user_id character varying,
-                    instance_id character varying,
-                    miner_uid integer,
-                    miner_hotkey character varying,
-                    error_message character varying,
-                    compute_multiplier double precision,
-                    bounty integer,
-                    metrics jsonb,
-                    started_at timestamp without time zone,
-                    completed_at timestamp without time zone,
-                    is_private boolean GENERATED ALWAYS AS ((metrics->>'p')::bool) STORED,
-                    normalized_compute double precision GENERATED ALWAYS AS ((metrics->>'nc')::float) STORED
-                ) PARTITION BY LIST(entry_id);
-                """)
-            )
+            # Drop the invocations table and all partitions - no longer needed for scoring
+            await conn.execute(text("DROP TABLE IF EXISTS invocations CASCADE"))
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
                 )
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_invocations_id ON invocations(invocation_id);")
             )
             await conn.execute(
                 text(
@@ -2420,30 +2311,9 @@ COMMIT;
             """)
             )
             await conn.execute(
-                text("""
-            DO $$
-            BEGIN
-              IF NOT EXISTS (
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'instance_audits'
-                  AND column_name = 'bounty'
-              ) THEN
-                ALTER TABLE instance_audits
-                ADD COLUMN bounty boolean DEFAULT false;
-
-                UPDATE instance_audits ia
-                SET bounty = true
-                WHERE instance_id IN (
-                  SELECT DISTINCT(instance_id)
-                  FROM invocations
-                  WHERE bounty > 0
-                );
-              END IF;
-            END
-            $$;
-            """)
+                text(
+                    "ALTER TABLE instance_audits ADD COLUMN IF NOT EXISTS bounty boolean DEFAULT false"
+                )
             )
             await conn.execute(
                 text("CREATE INDEX IF NOT EXISTS idx_ia_id ON instance_audits(instance_id);")
@@ -2456,7 +2326,18 @@ COMMIT;
                     "CREATE INDEX IF NOT EXISTS idx_ia_idd ON instance_audits(instance_id, deleted_at);"
                 )
             )
+            await conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ich_instance_started ON instance_compute_history(instance_id, started_at);"
+                )
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_cmh_d ON instance_compute_history (ended_at)")
+            )
             await conn.execute(text(INSTANCE_AUDIT_VIEW))
+
+        # Sync compute history from API on startup to ensure consistency
+        await self.reconcile_instance_compute_history()
 
         tasks = []
         try:

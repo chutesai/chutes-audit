@@ -13,13 +13,15 @@ In order to fully verify all blocks in the 7 day audit window, you must either u
   - This should really but a locally attached NVMe/SSD, preferably a raid 1 or 10 for some resiliency
   - Try to avoid network attached storage or shared drives which may encounter high latency, low IOPS, etc.
   - Disk performance is quite important here since the majority of calculations take place in postgres.
- 
+
 You can use lower spec machines but performance will be sub-optimal of course, and see below - likely need to tweak settings.
 
 #### Postgres configuration
 Based on the number of cores, RAM, etc., you will likely wish to change the postgres command in the docker-compose.yml file increasing or decreasing various values accordingly.
 
 ### Initial sync
+Before you begin, be sure to copy config/config.yml.example to config/config.yml and make any adjustments/changes you would like, particularly if you are a validator and wish to set weights.
+
 The first time you run this, it takes an extremely long time to sync, upwards of 8+ hours. Using faster disks/CPU and more RAM will help. Until the initial sync is finished, you will not set weights.
 
 ### Synthetics to help guarantee completeness of audit exports/weights
@@ -72,7 +74,7 @@ Before attempting to run the auditor, be sure to go through the `config/config.y
 Note: You will either need to add balance to your account, notify the chutes team of your username to enable free access, or use the `chutes link ...` command if you are a validator/subnet owner to enable free access: https://github.com/rayonlabs/chutes?tab=readme-ov-file#-validators-and-subnet-owners
 
 Once you have the config file updated, there are two ways to run it:
- 
+
 
 __Option 1:__ Run the autoupdater (Ensure you have python installed)
 
@@ -86,8 +88,8 @@ apt-get install -y -qq jq
 **Run the autoupdater**
 ```bash
 pm2 delete autoupdates || true && pm2 start --name "autoupdates" "python utils/autoupdater.py"
-``` 
- 
+```
+
 
 __Option 2:__ just use docker compose
 ```bash
