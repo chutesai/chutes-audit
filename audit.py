@@ -16,6 +16,7 @@ import backoff
 import tempfile
 import traceback
 import numpy as np
+import json as jjson
 import orjson as json
 import soundfile as sf
 import sounddevice as sd
@@ -443,11 +444,11 @@ class Auditor:
                 node_dict = dict(node)
                 node_dict.pop("last_updated", None)
                 node_dict["checksum"] = hashlib.sha256(
-                    json.dumps(node_dict, sort_keys=True).encode()
+                    jjson.dumps(node_dict, sort_keys=True).encode()
                 ).hexdigest()
                 statement = pg_insert(MetagraphNode).values(node_dict)
                 statement = statement.on_conflict_do_update(
-                    index_elements=["netuid", "hotkey"],
+                    index_elements=["hotkey"],
                     set_={key: getattr(statement.excluded, key) for key in node_dict.keys()},
                     where=MetagraphNode.checksum != node_dict["checksum"],
                 )
@@ -473,6 +474,7 @@ class Auditor:
                     {"chute_id": info["chute_id"], "gpu_count": info["gpu_count"]},
                 )
             await session.commit()
+        logger.success("Synced chute GPU counts.")
 
     async def reconcile_instance_audit_deletions(self, conn):
         """
@@ -1073,11 +1075,24 @@ COMMIT;
             block_hash=block_hash,
         )
         if commitment:
+            logger.info(f"COMMITMENT: {commitment=}")
             value = commitment.value if hasattr(commitment, "value") else commitment
             if value:
-                for c in value.get("info", {}).get("fields", []):
-                    if "Sha256" in c:
-                        return c["Sha256"][2:]
+                for field in value.get("info", {}).get("fields", []):
+                    # The substrate tuple encoding can wrap dicts/bytes in 1-item tuples.
+                    if isinstance(field, (list, tuple)) and len(field) == 1:
+                        field = field[0]
+                    if isinstance(field, dict) and "Sha256" in field:
+                        raw = field["Sha256"]
+                        if isinstance(raw, (list, tuple)) and len(raw) == 1:
+                            raw = raw[0]
+                        if isinstance(raw, (list, tuple)):
+                            try:
+                                return bytes(raw).hex()
+                            except (TypeError, ValueError):
+                                pass
+                        if isinstance(raw, (bytes, bytearray)):
+                            return bytes(raw).hex()
         logger.warning(f"Failed to get commit sha256 for {block=} from {who}")
         return None
 
@@ -1101,8 +1116,6 @@ COMMIT;
             logger.warning(
                 f"Could not find commitment for hotkey {record.hotkey} on netuid {self.netuid} in block {record.block}"
             )
-            if record.hotkey in self.validators:
-                return False
             return True
         if committed != calculated:
             if record.hotkey in self.validators:
@@ -1810,10 +1823,12 @@ COMMIT;
         """
         Fetch and verify all audit reports, returning the number of new reports from validators.
         """
+        logger.info("Checking for new audit report data...")
         async with self.aiosession() as session:
             async with session.get("https://api.chutes.ai/audit/") as resp:
                 audit_records = await resp.json()
                 by_id = {record["entry_id"]: record for record in audit_records}
+        logger.info("Fetched audit data list.")
 
         # Clean up the old data, plus get a list of existing items to skip.
         delete_directories = []
@@ -1826,16 +1841,24 @@ COMMIT;
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
+                logger.info(f"Purging old audit entry: {entry.entry_id}")
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
+            logger.info("Purging old synthetics...")
             await session.execute(
                 text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
             )
+            logger.info(f"Purging old compute history data...")
             await session.execute(
                 text(
                     "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '169 hours'"
                 )
             )
+            logger.info("Comitting...")
+            await session.commit()
+            logger.success("Session committed!")
+
+            logger.info("Collecting existing entry IDs...")
             existing_ids = (
                 (await session.execute(select(AuditEntry.entry_id))).unique().scalars().all()
             )
@@ -2307,6 +2330,11 @@ COMMIT;
             await conn.execute(
                 text(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_ich_instance_started ON instance_compute_history(instance_id, started_at);"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_cmh_d ON instance_compute_history (ended_at)"
                 )
             )
             await conn.execute(text(INSTANCE_AUDIT_VIEW))
