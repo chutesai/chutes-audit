@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: chutes_audit
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_data2:/var/lib/postgresql/data
     restart: always
 
   auditor:
@@ -26,12 +26,12 @@ services:
       - POSTGRES_DB=chutes_audit
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
-      - SKIP_MINER_AUDITS=${SKIP_MINER_AUDITS:-false}
+      - SKIP_MINER_AUDITS=${SKIP_MINER_AUDITS:-true}
       - CALCULATE_MINER_AGREEMENT=${CALCULATE_MINER_AGREEMENT:-false}
     restart: always
     depends_on:
       - postgres
 
 volumes:
-  pg_data:
+  pg_data2:
   hfhub:
