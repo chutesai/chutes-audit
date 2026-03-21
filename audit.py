@@ -634,6 +634,7 @@ COMMIT;
                             INSERT INTO instance_compute_history
                                 (instance_id, compute_multiplier, started_at, ended_at)
                             VALUES (:instance_id, :compute_multiplier, :started_at, :ended_at)
+                            ON CONFLICT (instance_id, started_at) DO UPDATE SET compute_multiplier = EXCLUDED.compute_multiplier, ended_at = EXCLUDED.ended_at
                         """),
                         record,
                     )
