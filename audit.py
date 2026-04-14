@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from typing import AsyncGenerator
 from datasets import load_dataset
 from bittensor_wallet import Keypair
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from langdetect import detect as detect_language
 from sqlalchemy.dialects.postgresql import insert
@@ -114,7 +114,17 @@ JOIN LATERAL (
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 
-SCORING_INTERVAL = "7 days"
+SCORING_INTERVAL = "1 day"
+
+
+def _weight_slot(now: datetime | None = None) -> datetime:
+    """Start of the :00 or :30 UTC half-hour window containing ``now``."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).replace(
+        minute=0 if now.minute < 30 else 30, second=0, microsecond=0
+    )
+
 
 # Instances lifetime/compute units queries - this is the entire basis for scoring!
 # Uses instance_compute_history for accurate time-weighted multipliers.
@@ -410,6 +420,7 @@ class Auditor:
         self.chutes = {}
         self.subtensor_url = self.config.subtensor
         self.netuid = getattr(self.config, "netuid", 64)
+        self._last_weight_slot: datetime | None = None
 
         # Keypair -- only set if you are a registered validator.
         self.ss58_address = None
@@ -417,6 +428,30 @@ class Auditor:
         if self.config.set_weights.enabled:
             self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
+
+    @property
+    def current_weight_slot(self) -> datetime:
+        """Start of the :00/:30 UTC half-hour window we are currently in."""
+        return _weight_slot()
+
+    @property
+    def last_weight_slot(self) -> datetime:
+        """
+        Last :00/:30 UTC slot for which weights were successfully set.
+        Initialised on first access so that:
+          - starting in the first half (minute < 30) defers until :30
+          - starting in the second half (minute >= 30) is immediately due
+        """
+        if self._last_weight_slot is None:
+            now = datetime.now(timezone.utc)
+            slot = _weight_slot(now)
+            self._last_weight_slot = slot - timedelta(minutes=30) if now.minute >= 30 else slot
+            logger.info(f"Weight-setting will start after slot {self._last_weight_slot.strftime('%H:%M')} UTC")
+        return self._last_weight_slot
+
+    @last_weight_slot.setter
+    def last_weight_slot(self, value: datetime) -> None:
+        self._last_weight_slot = value
 
     @staticmethod
     @asynccontextmanager
@@ -1835,7 +1870,7 @@ COMMIT;
         async with get_session() as session:
             query = select(AuditEntry).where(
                 or_(
-                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=7),
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=2),
                     AuditEntry.processed.is_(False),
                 )
             )
@@ -1846,12 +1881,12 @@ COMMIT;
                 delete_directories.append(f"/reports/{entry.entry_id}")
             logger.info("Purging old synthetics...")
             await session.execute(
-                text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
+                text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '49 hours'")
             )
             logger.info("Purging old compute history data...")
             await session.execute(
                 text(
-                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '169 hours'"
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '49 hours'"
                 )
             )
             logger.info("Comitting...")
@@ -2053,7 +2088,7 @@ COMMIT;
                 FROM miner_latest m
                 FULL OUTER JOIN validator_latest v
                     ON m.instance_id = v.instance_id AND m.miner_hotkey = v.miner_hotkey
-                WHERE COALESCE(m.created_at, v.created_at) >= NOW() - INTERVAL '7 days'
+                WHERE COALESCE(m.created_at, v.created_at) >= NOW() - INTERVAL '1 day'
                 ORDER BY COALESCE(m.miner_hotkey, v.miner_hotkey), COALESCE(m.created_at, v.created_at) DESC
             """)
 
@@ -2123,7 +2158,7 @@ COMMIT;
                         stats["multiplier_mismatches"] += 1
 
             # Log summary per miner
-            logger.info("Instance audit comparison (miner vs validator) - last 7 days:")
+            logger.info("Instance audit comparison (miner vs validator) - last 24 hours:")
             logger.info(
                 f"{'Hotkey':<20} {'Total':>6} {'Both':>6} {'M-Only':>7} {'V-Only':>7} "
                 f"{'TsMis':>6} {'MulMis':>7} {'M-Secs':>12} {'V-Secs':>12} {'Ratio':>6}"
@@ -2164,8 +2199,13 @@ COMMIT;
     async def _verify_integrity(self):
         """
         Continuously check for new audit data, verify the numbers line up, and set weights.
+        Data ingestion (metagraph, GPU counts, audit reports) runs every ~60s.
+        Weight-setting only fires once per :00/:30 UTC half-hour slot; a failed attempt
+        retries on the next 60s loop without skipping the slot.
         """
         first_run = True
+        self._last_weight_slot = None  # reset so last_weight_slot re-initialises on first access
+
         while self._running:
             try:
                 await self.sync_and_save_metagraph()
@@ -2176,7 +2216,6 @@ COMMIT;
                 continue
 
             if not await self.download_and_check_audit_reports():
-                # No new data, let's see how long we should wait before trying again.
                 async with get_session() as session:
                     most_recent = (
                         await session.execute(
@@ -2186,31 +2225,39 @@ COMMIT;
                 if not most_recent:
                     # This is basically impossible?
                     logger.warning("Should not be here, why???")
-
-                if first_run and most_recent:
+                elif first_run:
+                    # One-time diagnostic on startup when there's no new data yet.
                     logger.info(
                         "No new audit data, but here is the most recent weight data output from the "
                         f"report spanning {most_recent.start_time} through {most_recent.end_time}"
                     )
-                    await self.compare_weights_to_actual(await self.get_weights_to_set())
+                    try:
+                        await self.compare_weights_to_actual(await self.get_weights_to_set())
+                    except Exception as exc:
+                        logger.error(f"Initial weight comparison failed: {exc}")
                     try:
                         await self.compare_miner_metrics()
                     except Exception as exc:
                         logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
-                        # XXX not blocking though, because it's a comparison and miners often
-                        # don't report anyways.
             else:
-                if self.config.set_weights.enabled:
-                    await self.get_and_set_weights()
-                else:
-                    # If we aren't setting weights, we can at least examine them.
-                    await self.compare_weights_to_actual(await self.get_weights_to_set())
+                if self.current_weight_slot > self.last_weight_slot:
+                    try:
+                        if self.config.set_weights.enabled:
+                            await self.get_and_set_weights()
+                        else:
+                            # If we aren't setting weights, we can at least examine them.
+                            await self.compare_weights_to_actual(await self.get_weights_to_set())
+                        self.last_weight_slot = self.current_weight_slot
+                        logger.info(f"Weight slot {self.last_weight_slot.strftime('%H:%M')} UTC completed")
+                    except Exception as exc:
+                        logger.error(f"Weight-setting failed, will retry next loop: {exc}")
 
-                # Compare the validator stats to miner self-reported stats.
+                # Always compare miner metrics when new validator data has been processed.
                 try:
                     await self.compare_miner_metrics()
                 except Exception as exc:
                     logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
+
             await asyncio.sleep(60)
             first_run = False
 
