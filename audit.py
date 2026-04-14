@@ -117,15 +117,6 @@ VERSION_KEY = 69420
 SCORING_INTERVAL = "1 day"
 
 
-def _weight_slot(now: datetime | None = None) -> datetime:
-    """Start of the :00 or :30 UTC half-hour window containing ``now``."""
-    if now is None:
-        now = datetime.now(timezone.utc)
-    return now.astimezone(timezone.utc).replace(
-        minute=0 if now.minute < 30 else 30, second=0, microsecond=0
-    )
-
-
 # Instances lifetime/compute units queries - this is the entire basis for scoring!
 # Uses instance_compute_history for accurate time-weighted multipliers.
 # The history table includes the startup period (created_at to activated_at) at 0.3x rate,
@@ -420,7 +411,6 @@ class Auditor:
         self.chutes = {}
         self.subtensor_url = self.config.subtensor
         self.netuid = getattr(self.config, "netuid", 64)
-        self._last_weight_slot: datetime | None = None
 
         # Keypair -- only set if you are a registered validator.
         self.ss58_address = None
@@ -428,30 +418,6 @@ class Auditor:
         if self.config.set_weights.enabled:
             self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
-
-    @property
-    def current_weight_slot(self) -> datetime:
-        """Start of the :00/:30 UTC half-hour window we are currently in."""
-        return _weight_slot()
-
-    @property
-    def last_weight_slot(self) -> datetime:
-        """
-        Last :00/:30 UTC slot for which weights were successfully set.
-        Initialised on first access so that:
-          - starting in the first half (minute < 30) defers until :30
-          - starting in the second half (minute >= 30) is immediately due
-        """
-        if self._last_weight_slot is None:
-            now = datetime.now(timezone.utc)
-            slot = _weight_slot(now)
-            self._last_weight_slot = slot - timedelta(minutes=30) if now.minute >= 30 else slot
-            logger.info(f"Weight-setting will start after slot {self._last_weight_slot.strftime('%H:%M')} UTC")
-        return self._last_weight_slot
-
-    @last_weight_slot.setter
-    def last_weight_slot(self, value: datetime) -> None:
-        self._last_weight_slot = value
 
     @staticmethod
     @asynccontextmanager
@@ -2199,13 +2165,10 @@ COMMIT;
     async def _verify_integrity(self):
         """
         Continuously check for new audit data, verify the numbers line up, and set weights.
-        Data ingestion (metagraph, GPU counts, audit reports) runs every ~60s.
-        Weight-setting only fires once per :00/:30 UTC half-hour slot; a failed attempt
-        retries on the next 60s loop without skipping the slot.
+        Runs every ~60s. Weights are set whenever new validator audit data is processed,
+        keeping the auditor naturally in sync with the validator's hourly export cadence.
         """
         first_run = True
-        self._last_weight_slot = None  # reset so last_weight_slot re-initialises on first access
-
         while self._running:
             try:
                 await self.sync_and_save_metagraph()
@@ -2240,19 +2203,13 @@ COMMIT;
                     except Exception as exc:
                         logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
             else:
-                if self.current_weight_slot > self.last_weight_slot:
-                    try:
-                        if self.config.set_weights.enabled:
-                            await self.get_and_set_weights()
-                        else:
-                            # If we aren't setting weights, we can at least examine them.
-                            await self.compare_weights_to_actual(await self.get_weights_to_set())
-                        self.last_weight_slot = self.current_weight_slot
-                        logger.info(f"Weight slot {self.last_weight_slot.strftime('%H:%M')} UTC completed")
-                    except Exception as exc:
-                        logger.error(f"Weight-setting failed, will retry next loop: {exc}")
+                if self.config.set_weights.enabled:
+                    await self.get_and_set_weights()
+                else:
+                    # If we aren't setting weights, we can at least examine them.
+                    await self.compare_weights_to_actual(await self.get_weights_to_set())
 
-                # Always compare miner metrics when new validator data has been processed.
+                # Compare the validator stats to miner self-reported stats.
                 try:
                     await self.compare_miner_metrics()
                 except Exception as exc:
