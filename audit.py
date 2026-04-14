@@ -2165,8 +2165,8 @@ COMMIT;
     async def _verify_integrity(self):
         """
         Continuously check for new audit data, verify the numbers line up, and set weights.
-        Runs every ~60s. Weights are set whenever new validator audit data is processed,
-        keeping the auditor naturally in sync with the validator's hourly export cadence.
+        Polls every 60s waiting for new validator data. Once new data is processed and weights
+        are set, sleeps until the top of the next hour to match the validator's export cadence.
         """
         first_run = True
         while self._running:
@@ -2202,6 +2202,7 @@ COMMIT;
                         await self.compare_miner_metrics()
                     except Exception as exc:
                         logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
+                await asyncio.sleep(60)
             else:
                 if self.config.set_weights.enabled:
                     await self.get_and_set_weights()
@@ -2215,7 +2216,13 @@ COMMIT;
                 except Exception as exc:
                     logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
 
-            await asyncio.sleep(60)
+                # Sleep until the top of the next hour to match the validator's export cadence.
+                now = datetime.now(timezone.utc)
+                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                sleep_seconds = (next_hour - now).total_seconds()
+                logger.info(f"Weights set; sleeping {sleep_seconds:.0f}s until {next_hour.strftime('%H:%M')} UTC")
+                await asyncio.sleep(sleep_seconds)
+
             first_run = False
 
     async def verify_integrity_and_set_weights(self):
