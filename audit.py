@@ -1,41 +1,29 @@
-import io
 import os
 import re
 import csv
-from dataclasses import dataclass, field
 import sys
 import uuid
 import glob
 import yaml
 import tqdm
 import shutil
-import random
 import aiohttp
 import asyncio
 import hashlib
 import backoff
-import tempfile
 import traceback
-import numpy as np
 import json as jjson
 import orjson as json
-import soundfile as sf
-import sounddevice as sd
-import pybase64 as base64
 
 from pathlib import Path
 from loguru import logger
 from munch import munchify
 from typing import Optional
-from pydantic import BaseModel
 from typing import AsyncGenerator
-from datasets import load_dataset
 from bittensor_wallet import Keypair
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from langdetect import detect as detect_language
 from sqlalchemy.dialects.postgresql import insert
-from term_image.image import from_file as image_from_file
 from sqlalchemy.orm import sessionmaker, declarative_base
 from async_substrate_interface import AsyncSubstrateInterface
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -300,27 +288,6 @@ class AuditEntry(Base):
     processed = Column(Boolean, default=False)
 
 
-@dataclass
-class Synthetic:
-    parent_invocation_id: str
-    invocation_id: str
-    instance_id: str
-    chute_id: str
-    miner_uid: str
-    miner_hotkey: str
-    created_at: datetime
-    has_error: bool = field(default=False)
-
-
-class Target(BaseModel):
-    instance_id: str
-    invocation_id: str
-    child_id: str
-    uid: str
-    hotkey: str
-    error: str = None
-
-
 class MetagraphNode(Base):
     __tablename__ = "metagraph_nodes"
     hotkey = Column(String, primary_key=True)
@@ -378,22 +345,8 @@ class Auditor:
         logger.debug(f"Loading {config_path=}")
         with open(config_path, "r") as infile:
             self.config = munchify(yaml.safe_load(infile))
-        if self.config.synthetics.enabled:
-            text_config = self.config.synthetics.text
-            if text_config.enabled:
-                logger.debug(f"Loading text prompt dataset: {text_config.dataset.name}")
-                self.text_prompts = load_dataset(
-                    text_config.dataset.name, **dict(text_config.dataset.options)
-                )
-            image_config = self.config.synthetics.image
-            if image_config.enabled:
-                logger.debug(f"Loading image prompt dataset: {image_config.dataset.name}")
-                self.image_prompts = load_dataset(
-                    image_config.dataset.name, **dict(image_config.dataset.options)
-                )
         self.validators = {v.hotkey: v for v in self.config.validators}
         self._running = True
-        self.chutes = {}
         self.subtensor_url = self.config.subtensor
         self.netuid = getattr(self.config, "netuid", 64)
 
@@ -403,12 +356,6 @@ class Auditor:
         if self.config.set_weights.enabled:
             self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
-
-        # In-memory store for synthetic invocations, keyed by invocation_id.
-        # Checked against the validator's invocation CSV export, then pruned.
-        # Persisted to disk so the store survives restarts.
-        self._pending_synthetics: dict[str, Synthetic] = {}
-        self._synthetics_path = Path("/reports/pending_synthetics.json")
 
     @staticmethod
     @asynccontextmanager
@@ -643,451 +590,6 @@ COMMIT;
             await self.reconcile_instance_audit_deletions(conn)
         await self.reconcile_instance_compute_history()
 
-    def get_random_image_payload(self, model: str):
-        """
-        Get a random request payload for diffusion chutes.
-        """
-        prompt = self.image_prompts[random.randint(0, len(self.image_prompts))][
-            self.config.synthetics.image.dataset.field_name
-        ]
-        prompt = prompt.lstrip('"').rstrip('"').replace('\\"', '"')
-        return {
-            "prompt": prompt,
-            "seed": random.randint(0, 1000000000),
-            "num_inference_steps": random.randint(5, 30),
-        }
-
-    def get_random_text_payload(self, model: str, endpoint: str = "chat"):
-        """
-        Get a random prompt for vllm chutes.
-        """
-        messages = self.text_prompts[random.randint(0, len(self.text_prompts))][
-            self.config.synthetics.text.dataset.field_name
-        ]
-        messages = [
-            {
-                "role": message["role"],
-                "content": message["content"],
-            }
-            for message in messages
-        ]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": random.random() + 0.1,
-            "seed": random.randint(0, 1000000000),
-            "max_tokens": random.randint(10, 200),
-            "stream": True,
-            "logprobs": True,
-        }
-        if endpoint != "chat":
-            payload["prompt"] = payload.pop("messages")[0]["content"]
-        return payload
-
-    async def load_chutes(self):
-        """
-        Load chutes from the API.
-        """
-        logger.debug("Loading chutes from API...")
-        async with self.aiosession() as session:
-            async with session.get(
-                "https://api.chutes.ai/chutes/?include_public=true&limit=1000&exclude=affine"
-            ) as resp:
-                data = await resp.json()
-                chutes = {}
-                for item in data["items"]:
-                    item["cords"] = data.get("cord_refs", {}).get(item["cord_ref_id"], [])
-                    chutes[item["chute_id"]] = munchify(item)
-                self.chutes = chutes
-
-    def _get_vllm_chute(self):
-        """
-        Randomly select a hot vllm chute.
-        """
-        vllm_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "vllm"
-            and any([instance.active and instance.verified for instance in chute.instances])
-        ]
-        if not vllm_chutes:
-            logger.warning("No vllm chutes hot - this is very bad and should not really happen...")
-            return None
-        return random.choice(vllm_chutes)
-
-    def _get_diffusion_chute(self):
-        """
-        Randomly select a hot diffusion chute.
-        """
-        diffusion_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "diffusion"
-            and any([instance.active and instance.verified for instance in chute.instances])
-        ]
-        if not diffusion_chutes:
-            logger.warning(
-                "No diffusion chutes hot - this is very bad and should not really happen..."
-            )
-            return None
-        return random.choice(diffusion_chutes)
-
-    def _get_tts_chute(self):
-        """
-        Randomly select a hot TTS chute.
-        """
-        tts_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if any([cord.path == "/speak" and not cord.stream for cord in chute.cords])
-            and chute.user.username == "chutes"
-        ]
-        if not tts_chutes:
-            logger.warning("No TTS chutes hot.")
-            return None
-        return random.choice(tts_chutes)
-
-    def _get_tei_chute(self, endpoint: str = "/embed"):
-        """
-        Get text-embeding-inference chutes.
-        """
-        tei_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "tei"
-            and any([cord.path == endpoint for cord in chute.cords])
-            and chute.user.username == "chutes"
-        ]
-        if not tei_chutes:
-            logger.warning("No TEI chutes hot.")
-            return None
-        return random.choice(tei_chutes)
-
-    def _render(self, chute, data):
-        if chute.standard_template == "diffusion" and self.config.synthetics.image.render:
-            try:
-                if (
-                    chute.standard_template == "diffusion"
-                    and isinstance(data["result"], dict)
-                    and data["result"].get("bytes")
-                ):
-                    with tempfile.NamedTemporaryFile(mode="wb") as outfile:
-                        outfile.write(base64.b64decode(data["result"]["bytes"].encode()))
-                        outfile.flush()
-                        image = image_from_file(outfile.name)
-                        image.draw()
-            except Exception as exc:
-                logger.warning(f"Could not render image: {exc}")
-        elif chute.standard_template == "vllm" and self.config.synthetics.text.render:
-            try:
-                chunk_data = json.loads(data["result"][6:])
-                if chunk_data["choices"][0].get("delta"):
-                    print(chunk_data["choices"][0]["delta"]["content"], end="", flush=True)
-                else:
-                    print(chunk_data["choices"][0]["text"], end="", flush=True)
-            except Exception:
-                ...
-        elif chute.standard_template == "tts" and self.config.synthetics.tts.render:
-            try:
-                if isinstance(data["result"], dict) and data["result"].get("bytes"):
-                    chunk_data = base64.b64decode(data["result"]["bytes"].encode())
-                    audio_io = io.BytesIO(chunk_data)
-                    audio_chunk, sr = sf.read(audio_io)
-                    if len(audio_chunk.shape) > 1:
-                        audio_chunk = np.mean(audio_chunk, axis=1)
-                    audio_chunk = audio_chunk.astype(np.float32)
-                    logger.info("Playing audio, turn up your volume...")
-                    sd.play(audio_chunk, 24000)
-                    sd.wait()
-            except Exception as exc:
-                logger.warning(f"Error playing audio: {exc}")
-        elif chute.standard_template == "tei" and self.config.synthetics.embed.render:
-            try:
-                if data["result"].get("json"):
-                    logger.info(
-                        f"Generated a matrix with shape: {np.array(data['result']['json']).shape}"
-                    )
-            except Exception as exc:
-                logger.warning(f"Failed to render embeddings: {exc}")
-
-    async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
-        """
-        Perform invocation request.
-        """
-        try:
-            synthetics = []
-            async with self.aiosession() as session:
-                logger.info(f"Invoking {chute.name=} at {url}")
-                async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self.config.synthetics.api_key}",
-                        "X-Chutes-Trace": "true",
-                    },
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            f"Error sending synthetic to {chute.chute_id} [{chute.name}]: {resp.status=} {await resp.text()}"
-                        )
-                        return []
-                    parent_id = resp.headers["X-Chutes-InvocationID"]
-                    async for chunk_bytes in resp.content:
-                        if not chunk_bytes or not chunk_bytes.startswith(b"data: "):
-                            continue
-                        data = json.loads(chunk_bytes[6:])
-                        target = self._extract_target(data)
-                        if (target := self._extract_target(data)) is not None:
-                            self._debug_target(data)
-                            synthetics.append(
-                                Synthetic(
-                                    instance_id=target.instance_id,
-                                    parent_invocation_id=parent_id,
-                                    invocation_id=target.child_id,
-                                    chute_id=chute.chute_id,
-                                    miner_uid=target.uid,
-                                    miner_hotkey=target.hotkey,
-                                    created_at=func.timezone("UTC", func.now()),
-                                    has_error=False,
-                                )
-                            )
-                        elif (target := self._extract_target_error(data)) is not None:
-                            logger.warning(target.error)
-                            # Can't really not be the case that we're not talking about the existing attempt.
-                            assert target.instance_id == synthetics[-1].instance_id
-                            assert target.invocation_id == synthetics[-1].invocation_id
-                            synthetics[-1].has_error = True
-                        elif data.get("error"):
-                            logger.error(data["error"])
-                        elif data.get("result"):
-                            self._render(chute, data)
-            return synthetics
-        except Exception as exc:
-            logger.warning(f"Error performing synthetic request: {exc}")
-        return []
-
-    @staticmethod
-    def _debug_target(chunk) -> None:
-        """
-        Show debug logging for a chute invocation target.
-        """
-        message = "".join(
-            [
-                chunk["trace"]["timestamp"],
-                " ["
-                + " ".join(
-                    [
-                        f"{key}={value}"
-                        for key, value in chunk["trace"].items()
-                        if key not in ("timestamp", "message")
-                    ]
-                ),
-                f"]: {chunk['trace']['message']}",
-            ]
-        )
-        logger.info(message)
-
-    @staticmethod
-    def _extract_target(chunk) -> Target:
-        """
-        Extract miner info from trace messages.
-        """
-        if not chunk.get("trace"):
-            return None
-        message = chunk["trace"].get("message")
-        re_match = re.search(r"query target=([^ ]+) uid=([0-9+]+) hotkey=([^ ]+)", message)
-        if re_match:
-            return Target(
-                invocation_id=chunk["trace"].get("invocation_id"),
-                child_id=chunk["trace"].get("child_id"),
-                instance_id=re_match.group(1),
-                uid=re_match.group(2),
-                hotkey=re_match.group(3),
-            )
-        return None
-
-    @staticmethod
-    def _extract_target_error(chunk) -> Target:
-        """
-        Extract target errors from trace messages.
-        """
-        if not chunk.get("trace"):
-            return None
-        message = chunk["trace"].get("message")
-        re_match = re.search(
-            r"error encountered while querying target=([^ ]+) uid=([0-9]+) hotkey=([^ ]+) coldkey=[^ ]+: (.*)",
-            message,
-        )
-        if re_match:
-            return Target(
-                invocation_id=chunk["trace"].get("invocation_id"),
-                child_id=chunk["trace"].get("child_id"),
-                instance_id=re_match.group(1),
-                uid=re_match.group(2),
-                hotkey=re_match.group(3),
-                error=re_match.group(4),
-            )
-
-    async def _perform_chat(self) -> list[Synthetic]:
-        """
-        Perform a single chat request, with trace SSEs to see raw events.
-        """
-        if (chute := self._get_vllm_chute()) is None:
-            return None
-        payload = self.get_random_text_payload(model=chute.name, endpoint="chat")
-        synthetics = await self._perform_request(
-            chute, payload, "https://llm.chutes.ai/v1/chat/completions"
-        )
-        print("", flush=True)
-        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_completion(self) -> list[Synthetic]:
-        """
-        Perform a single LLM completion request, with trace SSEs to see raw events.
-        """
-        if (chute := self._get_vllm_chute()) is None:
-            return []
-        payload = self.get_random_text_payload(model=chute.name, endpoint="completion")
-        synthetics = await self._perform_request(
-            chute, payload, "https://llm.chutes.ai/v1/completions"
-        )
-        print("", flush=True)
-        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_image(self) -> list[Synthetic]:
-        """
-        Perform a single image generation request.
-        """
-        if (chute := self._get_diffusion_chute()) is None:
-            return []
-        payload = self.get_random_image_payload(model=chute.name)
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/generate"
-        )
-        logger.info(f"Image generation request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_tts(self) -> list[Synthetic]:
-        """
-        Perform a single text-to-speech request.
-        """
-        if (chute := self._get_tts_chute()) is None:
-            return []
-        while text := self.get_random_image_payload(model=chute.name)["prompt"][:1000]:
-            try:
-                language = detect_language(text)
-                if language == "en":
-                    break
-            except Exception:
-                ...
-        chute.standard_template = "tts"
-        payload = {"text": text}
-        if chute.name == "Kokoro-82M":
-            payload["voice"] = random.choice(
-                [
-                    "af",
-                    "af_bella",
-                    "af_sarah",
-                    "am_adam",
-                    "am_michael",
-                    "bf_emma",
-                    "bf_isabella",
-                    "bm_george",
-                    "bm_lewis",
-                    "af_nicole",
-                    "af_sky",
-                ]
-            )
-
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/speak"
-        )
-        logger.info(f"TTS generation request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_embedding(self) -> list[Synthetic]:
-        """
-        Perform a single text embedding request.
-        """
-        if (chute := self._get_tei_chute("/embed")) is None:
-            return []
-        text = self.get_random_image_payload(model=chute.name)["prompt"][:500]
-        payload = {"inputs": [text]}
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/embed"
-        )
-        logger.info(f"Text embedding request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    def _save_pending_synthetics(self):
-        """Persist in-memory pending synthetics to disk so they survive restarts."""
-        try:
-            self._synthetics_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                inv_id: {
-                    "parent_invocation_id": s.parent_invocation_id,
-                    "invocation_id": s.invocation_id,
-                    "instance_id": s.instance_id,
-                    "chute_id": s.chute_id,
-                    "miner_uid": s.miner_uid,
-                    "miner_hotkey": s.miner_hotkey,
-                    "created_at": s.created_at.isoformat(),
-                    "has_error": s.has_error,
-                }
-                for inv_id, s in self._pending_synthetics.items()
-            }
-            self._synthetics_path.write_text(json.dumps(data))
-        except Exception as exc:
-            logger.warning(f"Failed to save pending synthetics to disk: {exc}")
-
-    def _load_pending_synthetics(self):
-        """Load previously persisted pending synthetics from disk on startup."""
-        if not self._synthetics_path.exists():
-            return
-        try:
-            data = json.loads(self._synthetics_path.read_text())
-            for inv_id, s in data.items():
-                self._pending_synthetics[inv_id] = Synthetic(
-                    parent_invocation_id=s["parent_invocation_id"],
-                    invocation_id=s["invocation_id"],
-                    instance_id=s["instance_id"],
-                    chute_id=s["chute_id"],
-                    miner_uid=s["miner_uid"],
-                    miner_hotkey=s["miner_hotkey"],
-                    created_at=datetime.fromisoformat(s["created_at"]),
-                    has_error=s.get("has_error", False),
-                )
-            logger.info(f"Loaded {len(self._pending_synthetics)} pending synthetics from disk")
-        except Exception as exc:
-            logger.warning(f"Failed to load pending synthetics from disk: {exc}")
-
-    async def perform_synthetic(self):
-        """
-        Send a single, random synthetic request.
-        """
-        await self.load_chutes()
-
-        # Randomly select a task to perform.
-        task_type = random.choice(
-            [
-                "chat",
-                "completion",
-                "image",
-                "tts",
-                "embedding",
-            ]
-        )
-        logger.info(f"Attempting to perform synthetic task: {task_type=}")
-        synthetics = await getattr(self, f"_perform_{task_type}")()
-        if not synthetics:
-            return
-        for synthetic in synthetics:
-            self._pending_synthetics[synthetic.invocation_id] = synthetic
-        self._save_pending_synthetics()
-        logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
-
     async def get_block_hash(self, substrate: AsyncSubstrateInterface, block: int) -> str:
         """
         Get a block (number) hash.
@@ -1215,7 +717,6 @@ COMMIT;
             raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
         path.parent.mkdir(parents=True, exist_ok=True)
         audit_content = None
-        inv_csv_path = None
         jobs_csv_path = None
         data = None
         async with self.aiosession() as session:
@@ -1229,14 +730,6 @@ COMMIT;
 
                 if db_record.hotkey in self.validators:
                     vali_url = self.validators[db_record.hotkey]["url"]
-
-                    # Invocations CSV exports.
-                    inv = data.get("csv_exports", {}).get("invocations")
-                    if inv:
-                        remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
-                        inv_csv_path = await self._download_csv(
-                            session, vali_url, remote_path, inv["path"], inv["sha256"], db_record
-                        )
 
                     # Jobs CSV exports.
                     jobs = data.get("csv_exports", {}).get("jobs")
@@ -1264,62 +757,7 @@ COMMIT;
                     raise IntegrityViolation(
                         f"Commitment on chain does not match downloaded report! {db_record=}"
                     )
-        return data, inv_csv_path, jobs_csv_path
-
-    async def check_synthetics_in_csv(self, csv_path: str, db_record) -> None:
-        """
-        Check if our in-memory pending synthetics appear in the validator's invocation CSV export.
-        Prunes synthetics older than the report's end_time after checking.
-        """
-        csv_invocation_ids = set()
-        csv_invocations_by_id = {}
-        with open(csv_path, "r", newline="") as infile:
-            reader = csv.DictReader(infile)
-            for row in reader:
-                inv_id = row.get("invocation_id")
-                if inv_id:
-                    csv_invocation_ids.add(inv_id)
-                    csv_invocations_by_id[inv_id] = row
-
-        # Check pending synthetics that fall within this report window
-        to_check = {
-            inv_id: s
-            for inv_id, s in self._pending_synthetics.items()
-            if s.created_at < db_record.end_time
-        }
-
-        missing_count = 0
-        mismatched_count = 0
-        for inv_id, synthetic in to_check.items():
-            if inv_id not in csv_invocation_ids:
-                missing_count += 1
-                logger.warning(
-                    f"SYNTHETIC MISSING from CSV: invocation_id={inv_id} "
-                    f"instance_id={synthetic.instance_id} "
-                    f"miner_hotkey={synthetic.miner_hotkey}"
-                )
-            else:
-                csv_row = csv_invocations_by_id.get(inv_id)
-                if csv_row and csv_row.get("miner_hotkey") != synthetic.miner_hotkey:
-                    mismatched_count += 1
-                    logger.warning(
-                        f"SYNTHETIC MINER MISMATCH: invocation_id={inv_id} "
-                        f"expected={synthetic.miner_hotkey} "
-                        f"got={csv_row.get('miner_hotkey')}"
-                    )
-
-        if missing_count or mismatched_count:
-            logger.warning(
-                f"Synthetic validation: {missing_count} missing, {mismatched_count} mismatched "
-                f"out of {len(to_check)} synthetics checked"
-            )
-        else:
-            logger.info(f"All {len(to_check)} synthetics validated against CSV")
-
-        # Prune checked synthetics from memory
-        for inv_id in list(to_check.keys()):
-            self._pending_synthetics.pop(inv_id, None)
-        self._save_pending_synthetics()
+        return data, jobs_csv_path
 
     async def load_jobs(self, session, csv_path):
         """
@@ -1863,11 +1301,7 @@ COMMIT;
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            (
-                audit_data,
-                inv_csv_path,
-                jobs_csv_path,
-            ) = await self.download_and_check_one(db_record)
+            (audit_data, jobs_csv_path) = await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:
@@ -1876,9 +1310,7 @@ COMMIT;
                 logger.success(
                     f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}"
                 )
-                # Check synthetics against invocation CSV if it's from a validator.
-                if inv_csv_path:
-                    await self.check_synthetics_in_csv(inv_csv_path, db_record)
+                if db_record.hotkey in self.validators:
                     await session.execute(
                         text(
                             "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
@@ -1920,15 +1352,6 @@ COMMIT;
             await self.reconcile_instance_compute_history()
 
         return validator_total
-
-    async def send_and_verify_synthetics(self):
-        """
-        Continuously send synthetic requests. Verification is done via check_synthetics_in_csv
-        when processing validator audit CSV exports.
-        """
-        while self._running and self.config.synthetics.enabled:
-            await self.perform_synthetic()
-            await asyncio.sleep(60)
 
     async def compare_weights_to_actual(self, weights_tuple):
         """
@@ -2268,7 +1691,6 @@ COMMIT;
             # Drop tables no longer used for scoring
             await conn.execute(text("DROP TABLE IF EXISTS invocations CASCADE"))
             await conn.execute(text("DROP TABLE IF EXISTS reports CASCADE"))
-            await conn.execute(text("DROP TABLE IF EXISTS synthetics CASCADE"))
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(
                 text(
@@ -2310,13 +1732,9 @@ COMMIT;
         # Sync compute history from API on startup to ensure consistency
         await self.reconcile_instance_compute_history()
 
-        # Restore any pending synthetics that were saved before the last shutdown.
-        self._load_pending_synthetics()
-
         tasks = []
         try:
             tasks.append(asyncio.create_task(self.verify_integrity_and_set_weights()))
-            tasks.append(asyncio.create_task(self.send_and_verify_synthetics()))
             while True:
                 await asyncio.sleep(60)
         except KeyboardInterrupt:
