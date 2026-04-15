@@ -406,7 +406,9 @@ class Auditor:
 
         # In-memory store for synthetic invocations, keyed by invocation_id.
         # Checked against the validator's invocation CSV export, then pruned.
+        # Persisted to disk so the store survives restarts.
         self._pending_synthetics: dict[str, Synthetic] = {}
+        self._synthetics_path = Path("/reports/pending_synthetics.json")
 
     @staticmethod
     @asynccontextmanager
@@ -1019,6 +1021,48 @@ COMMIT;
         logger.info(f"Text embedding request generated {len(synthetics)} invocation objects.")
         return synthetics
 
+    def _save_pending_synthetics(self):
+        """Persist in-memory pending synthetics to disk so they survive restarts."""
+        try:
+            self._synthetics_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                inv_id: {
+                    "parent_invocation_id": s.parent_invocation_id,
+                    "invocation_id": s.invocation_id,
+                    "instance_id": s.instance_id,
+                    "chute_id": s.chute_id,
+                    "miner_uid": s.miner_uid,
+                    "miner_hotkey": s.miner_hotkey,
+                    "created_at": s.created_at.isoformat(),
+                    "has_error": s.has_error,
+                }
+                for inv_id, s in self._pending_synthetics.items()
+            }
+            self._synthetics_path.write_text(json.dumps(data))
+        except Exception as exc:
+            logger.warning(f"Failed to save pending synthetics to disk: {exc}")
+
+    def _load_pending_synthetics(self):
+        """Load previously persisted pending synthetics from disk on startup."""
+        if not self._synthetics_path.exists():
+            return
+        try:
+            data = json.loads(self._synthetics_path.read_text())
+            for inv_id, s in data.items():
+                self._pending_synthetics[inv_id] = Synthetic(
+                    parent_invocation_id=s["parent_invocation_id"],
+                    invocation_id=s["invocation_id"],
+                    instance_id=s["instance_id"],
+                    chute_id=s["chute_id"],
+                    miner_uid=s["miner_uid"],
+                    miner_hotkey=s["miner_hotkey"],
+                    created_at=datetime.fromisoformat(s["created_at"]),
+                    has_error=s.get("has_error", False),
+                )
+            logger.info(f"Loaded {len(self._pending_synthetics)} pending synthetics from disk")
+        except Exception as exc:
+            logger.warning(f"Failed to load pending synthetics from disk: {exc}")
+
     async def perform_synthetic(self):
         """
         Send a single, random synthetic request.
@@ -1041,6 +1085,7 @@ COMMIT;
             return
         for synthetic in synthetics:
             self._pending_synthetics[synthetic.invocation_id] = synthetic
+        self._save_pending_synthetics()
         logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
 
     async def get_block_hash(self, substrate: AsyncSubstrateInterface, block: int) -> str:
@@ -1274,6 +1319,7 @@ COMMIT;
         # Prune checked synthetics from memory
         for inv_id in list(to_check.keys()):
             self._pending_synthetics.pop(inv_id, None)
+        self._save_pending_synthetics()
 
     async def load_jobs(self, session, csv_path):
         """
@@ -1756,7 +1802,7 @@ COMMIT;
         async with get_session() as session:
             query = select(AuditEntry).where(
                 or_(
-                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=1),
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=2),
                     AuditEntry.processed.is_(False),
                 )
             )
@@ -1768,7 +1814,7 @@ COMMIT;
             logger.info("Purging old compute history data...")
             await session.execute(
                 text(
-                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '25 hours'"
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '2 days'"
                 )
             )
             logger.info("Comitting...")
@@ -2263,6 +2309,9 @@ COMMIT;
 
         # Sync compute history from API on startup to ensure consistency
         await self.reconcile_instance_compute_history()
+
+        # Restore any pending synthetics that were saved before the last shutdown.
+        self._load_pending_synthetics()
 
         tasks = []
         try:
