@@ -2,6 +2,7 @@ import io
 import os
 import re
 import csv
+from dataclasses import dataclass, field
 import sys
 import uuid
 import glob
@@ -229,22 +230,6 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-class Report(Base):
-    __tablename__ = "reports"
-    invocation_id = Column(String, nullable=False, primary_key=True)
-    user_id = Column(String, nullable=False)
-    timestamp = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-    confirmed_at = Column(DateTime(timezone=True))
-    confirmed_by = Column(String)
-    reason = Column(String, nullable=False)
-
-    __table_args__ = (Index("idx_report_inv_cnfrm", "invocation_id", "confirmed_at"),)
-
-
 class InstanceAudit(Base):
     __tablename__ = "instance_audits"
     audit_id = Column(String, primary_key=True)
@@ -315,16 +300,16 @@ class AuditEntry(Base):
     processed = Column(Boolean, default=False)
 
 
-class Synthetic(Base):
-    __tablename__ = "synthetics"
-    parent_invocation_id = Column(String, primary_key=True)
-    invocation_id = Column(String)
-    instance_id = Column(String)
-    chute_id = Column(String)
-    miner_uid = Column(String)
-    miner_hotkey = Column(String)
-    created_at = Column(DateTime(timezone=False))
-    has_error = Column(Boolean, default=False)
+@dataclass
+class Synthetic:
+    parent_invocation_id: str
+    invocation_id: str
+    instance_id: str
+    chute_id: str
+    miner_uid: str
+    miner_hotkey: str
+    created_at: datetime
+    has_error: bool = field(default=False)
 
 
 class Target(BaseModel):
@@ -418,6 +403,10 @@ class Auditor:
         if self.config.set_weights.enabled:
             self.ss58_address = self.config.set_weights.ss58_address
             self.keypair = Keypair.create_from_seed(self.config.set_weights.secret_seed)
+
+        # In-memory store for synthetic invocations, keyed by invocation_id.
+        # Checked against the validator's invocation CSV export, then pruned.
+        self._pending_synthetics: dict[str, Synthetic] = {}
 
     @staticmethod
     @asynccontextmanager
@@ -1050,10 +1039,8 @@ COMMIT;
         synthetics = await getattr(self, f"_perform_{task_type}")()
         if not synthetics:
             return
-        async with get_session() as session:
-            for synthetic in synthetics:
-                session.add(synthetic)
-            await session.commit()
+        for synthetic in synthetics:
+            self._pending_synthetics[synthetic.invocation_id] = synthetic
         logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
 
     async def get_block_hash(self, substrate: AsyncSubstrateInterface, block: int) -> str:
@@ -1184,7 +1171,6 @@ COMMIT;
         path.parent.mkdir(parents=True, exist_ok=True)
         audit_content = None
         inv_csv_path = None
-        reports_csv_path = None
         jobs_csv_path = None
         data = None
         async with self.aiosession() as session:
@@ -1205,21 +1191,6 @@ COMMIT;
                         remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
                         inv_csv_path = await self._download_csv(
                             session, vali_url, remote_path, inv["path"], inv["sha256"], db_record
-                        )
-
-                    # Reports CSV exports.
-                    reports = data.get("csv_exports", {}).get("reports")
-                    if reports:
-                        remote_path = reports["path"].replace(
-                            "invocations/", "/invocations/exports/"
-                        )
-                        reports_csv_path = await self._download_csv(
-                            session,
-                            vali_url,
-                            remote_path,
-                            reports["path"],
-                            reports["sha256"],
-                            db_record,
                         )
 
                     # Jobs CSV exports.
@@ -1248,15 +1219,13 @@ COMMIT;
                     raise IntegrityViolation(
                         f"Commitment on chain does not match downloaded report! {db_record=}"
                     )
-        return data, inv_csv_path, reports_csv_path, jobs_csv_path
+        return data, inv_csv_path, jobs_csv_path
 
     async def check_synthetics_in_csv(self, csv_path: str, db_record) -> None:
         """
-        Check if our local synthetics appear in the validator's invocation CSV export.
-        This validates that synthetic requests were properly tracked without loading
-        all invocation data into the database.
+        Check if our in-memory pending synthetics appear in the validator's invocation CSV export.
+        Prunes synthetics older than the report's end_time after checking.
         """
-        # Build a set of invocation_ids from the CSV for fast lookup
         csv_invocation_ids = set()
         csv_invocations_by_id = {}
         with open(csv_path, "r", newline="") as infile:
@@ -1267,93 +1236,44 @@ COMMIT;
                     csv_invocation_ids.add(inv_id)
                     csv_invocations_by_id[inv_id] = row
 
-        # Get synthetics that should have been tracked by this validator's report
-        async with get_session() as session:
-            result = await session.execute(
-                text(
-                    """
-                    SELECT parent_invocation_id, invocation_id, instance_id,
-                           chute_id, miner_uid, miner_hotkey, created_at
-                    FROM synthetics
-                    WHERE created_at < :end_time
-                    """
-                ),
-                {"end_time": db_record.end_time},
-            )
-            synthetics = result.mappings().all()
+        # Check pending synthetics that fall within this report window
+        to_check = {
+            inv_id: s
+            for inv_id, s in self._pending_synthetics.items()
+            if s.created_at < db_record.end_time
+        }
 
-        # Check each synthetic against the CSV
         missing_count = 0
         mismatched_count = 0
-        for synthetic in synthetics:
-            inv_id = synthetic["invocation_id"]
+        for inv_id, synthetic in to_check.items():
             if inv_id not in csv_invocation_ids:
                 missing_count += 1
                 logger.warning(
                     f"SYNTHETIC MISSING from CSV: invocation_id={inv_id} "
-                    f"instance_id={synthetic['instance_id']} "
-                    f"miner_hotkey={synthetic['miner_hotkey']}"
+                    f"instance_id={synthetic.instance_id} "
+                    f"miner_hotkey={synthetic.miner_hotkey}"
                 )
             else:
-                # Check miner_hotkey matches
                 csv_row = csv_invocations_by_id.get(inv_id)
-                if csv_row and csv_row.get("miner_hotkey") != synthetic["miner_hotkey"]:
+                if csv_row and csv_row.get("miner_hotkey") != synthetic.miner_hotkey:
                     mismatched_count += 1
                     logger.warning(
                         f"SYNTHETIC MINER MISMATCH: invocation_id={inv_id} "
-                        f"expected={synthetic['miner_hotkey']} "
+                        f"expected={synthetic.miner_hotkey} "
                         f"got={csv_row.get('miner_hotkey')}"
                     )
 
         if missing_count or mismatched_count:
             logger.warning(
                 f"Synthetic validation: {missing_count} missing, {mismatched_count} mismatched "
-                f"out of {len(synthetics)} synthetics checked"
+                f"out of {len(to_check)} synthetics checked"
             )
         else:
-            logger.info(f"All {len(synthetics)} synthetics validated against CSV")
+            logger.info(f"All {len(to_check)} synthetics validated against CSV")
 
-    async def load_reports(self, session, csv_path):
-        """
-        Populate our local database with invocaton reports from CSV.
-        """
-        logger.info(f"Inserting invocation report records from {csv_path}")
-        total = 0
-        with open(csv_path, "r") as infile:
-            reader = csv.DictReader(infile)
-            batch = []
-            for row in reader:
-                row_data = dict(row)
-                row_data.update(
-                    {
-                        "timestamp": datetime.fromisoformat(row["timestamp"].rstrip("Z")).replace(
-                            tzinfo=None
-                        ),
-                    }
-                )
-                if row["confirmed_at"]:
-                    row_data.update(
-                        {
-                            "confirmed_at": datetime.fromisoformat(
-                                row["confirmed_at"].rstrip("Z")
-                            ).replace(tzinfo=None)
-                        }
-                    )
-                for key in row_data:
-                    if isinstance(row_data[key], str) and not row_data[key].strip():
-                        row_data[key] = None
-                batch.append(row_data)
-                total += 1
-                if len(batch) == 100:
-                    bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
-                    await session.execute(bulk_insert)
-                    batch = []
-            if batch:
-                bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
-                await session.execute(bulk_insert)
-            await session.commit()
-        if total:
-            logger.success(f"Successfully loaded {total} reports from {csv_path}")
+        # Prune checked synthetics from memory
+        for inv_id in list(to_check.keys()):
+            self._pending_synthetics.pop(inv_id, None)
 
     async def load_jobs(self, session, csv_path):
         """
@@ -1836,7 +1756,7 @@ COMMIT;
         async with get_session() as session:
             query = select(AuditEntry).where(
                 or_(
-                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=2),
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=1),
                     AuditEntry.processed.is_(False),
                 )
             )
@@ -1845,14 +1765,10 @@ COMMIT;
                 logger.info(f"Purging old audit entry: {entry.entry_id}")
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
-            logger.info("Purging old synthetics...")
-            await session.execute(
-                text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '49 hours'")
-            )
             logger.info("Purging old compute history data...")
             await session.execute(
                 text(
-                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '49 hours'"
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '25 hours'"
                 )
             )
             logger.info("Comitting...")
@@ -1904,7 +1820,6 @@ COMMIT;
             (
                 audit_data,
                 inv_csv_path,
-                reports_csv_path,
                 jobs_csv_path,
             ) = await self.download_and_check_one(db_record)
 
@@ -1918,21 +1833,12 @@ COMMIT;
                 # Check synthetics against invocation CSV if it's from a validator.
                 if inv_csv_path:
                     await self.check_synthetics_in_csv(inv_csv_path, db_record)
-                    # Delete synthetics that have been validated
-                    await session.execute(
-                        text("DELETE FROM synthetics WHERE created_at < :end_time"),
-                        {"end_time": db_record.end_time},
-                    )
                     await session.execute(
                         text(
                             "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
                         ),
                         {"entry_id": db_record.entry_id},
                     )
-
-                # Load reports CSV.
-                if reports_csv_path:
-                    await self.load_reports(session, reports_csv_path)
 
                 # Load jobs CSV.
                 if jobs_csv_path:
@@ -2313,14 +2219,11 @@ COMMIT;
         Main loop, to do all the things.
         """
         async with engine.begin() as conn:
-            # Drop the invocations table and all partitions - no longer needed for scoring
+            # Drop tables no longer used for scoring
             await conn.execute(text("DROP TABLE IF EXISTS invocations CASCADE"))
+            await conn.execute(text("DROP TABLE IF EXISTS reports CASCADE"))
+            await conn.execute(text("DROP TABLE IF EXISTS synthetics CASCADE"))
             await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
-                )
-            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
