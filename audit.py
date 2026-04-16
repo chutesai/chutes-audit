@@ -1457,7 +1457,7 @@ COMMIT;
                 stats = miner_stats[hotkey]
                 stats["total"] += 1
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
                 if row["presence"] == "miner_missing":
                     stats["validator_only"] += 1
                     if row["v_activated"]:
@@ -1595,7 +1595,8 @@ COMMIT;
                 now = datetime.now(timezone.utc)
                 next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
                 sleep_seconds = (next_hour - now).total_seconds()
-                logger.info(f"Weights set; sleeping {sleep_seconds:.0f}s until {next_hour.strftime('%H:%M')} UTC")
+                action = "Weights set" if self.config.set_weights.enabled else "Audit complete"
+                logger.info(f"{action}; sleeping {sleep_seconds:.0f}s until {next_hour.strftime('%H:%M')} UTC")
                 await asyncio.sleep(sleep_seconds)
 
             first_run = False
