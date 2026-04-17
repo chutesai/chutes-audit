@@ -1240,7 +1240,7 @@ COMMIT;
         async with get_session() as session:
             query = select(AuditEntry).where(
                 or_(
-                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=2),
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=1),
                     AuditEntry.processed.is_(False),
                 )
             )
@@ -1252,7 +1252,7 @@ COMMIT;
             logger.info("Purging old compute history data...")
             await session.execute(
                 text(
-                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '2 days'"
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at < NOW() - interval '1 day'"
                 )
             )
             logger.info("Comitting...")
