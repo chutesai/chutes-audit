@@ -1,4 +1,3 @@
-import io
 import os
 import re
 import csv
@@ -8,33 +7,23 @@ import glob
 import yaml
 import tqdm
 import shutil
-import random
 import aiohttp
 import asyncio
 import hashlib
 import backoff
-import tempfile
 import traceback
-import numpy as np
 import json as jjson
 import orjson as json
-import soundfile as sf
-import sounddevice as sd
-import pybase64 as base64
 
 from pathlib import Path
 from loguru import logger
 from munch import munchify
 from typing import Optional
-from pydantic import BaseModel
 from typing import AsyncGenerator
-from datasets import load_dataset
 from bittensor_wallet import Keypair
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from langdetect import detect as detect_language
 from sqlalchemy.dialects.postgresql import insert
-from term_image.image import from_file as image_from_file
 from sqlalchemy.orm import sessionmaker, declarative_base
 from async_substrate_interface import AsyncSubstrateInterface
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -114,7 +103,8 @@ JOIN LATERAL (
 # Query and score weighting values to use for calculating incentive/setting weights.
 VERSION_KEY = 69420
 
-SCORING_INTERVAL = "7 days"
+SCORING_INTERVAL = "1 day"
+
 
 # Instances lifetime/compute units queries - this is the entire basis for scoring!
 # Uses instance_compute_history for accurate time-weighted multipliers.
@@ -228,22 +218,6 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-class Report(Base):
-    __tablename__ = "reports"
-    invocation_id = Column(String, nullable=False, primary_key=True)
-    user_id = Column(String, nullable=False)
-    timestamp = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-    confirmed_at = Column(DateTime(timezone=True))
-    confirmed_by = Column(String)
-    reason = Column(String, nullable=False)
-
-    __table_args__ = (Index("idx_report_inv_cnfrm", "invocation_id", "confirmed_at"),)
-
-
 class InstanceAudit(Base):
     __tablename__ = "instance_audits"
     audit_id = Column(String, primary_key=True)
@@ -314,27 +288,6 @@ class AuditEntry(Base):
     processed = Column(Boolean, default=False)
 
 
-class Synthetic(Base):
-    __tablename__ = "synthetics"
-    parent_invocation_id = Column(String, primary_key=True)
-    invocation_id = Column(String)
-    instance_id = Column(String)
-    chute_id = Column(String)
-    miner_uid = Column(String)
-    miner_hotkey = Column(String)
-    created_at = Column(DateTime(timezone=False))
-    has_error = Column(Boolean, default=False)
-
-
-class Target(BaseModel):
-    instance_id: str
-    invocation_id: str
-    child_id: str
-    uid: str
-    hotkey: str
-    error: str = None
-
-
 class MetagraphNode(Base):
     __tablename__ = "metagraph_nodes"
     hotkey = Column(String, primary_key=True)
@@ -392,22 +345,8 @@ class Auditor:
         logger.debug(f"Loading {config_path=}")
         with open(config_path, "r") as infile:
             self.config = munchify(yaml.safe_load(infile))
-        if self.config.synthetics.enabled:
-            text_config = self.config.synthetics.text
-            if text_config.enabled:
-                logger.debug(f"Loading text prompt dataset: {text_config.dataset.name}")
-                self.text_prompts = load_dataset(
-                    text_config.dataset.name, **dict(text_config.dataset.options)
-                )
-            image_config = self.config.synthetics.image
-            if image_config.enabled:
-                logger.debug(f"Loading image prompt dataset: {image_config.dataset.name}")
-                self.image_prompts = load_dataset(
-                    image_config.dataset.name, **dict(image_config.dataset.options)
-                )
         self.validators = {v.hotkey: v for v in self.config.validators}
         self._running = True
-        self.chutes = {}
         self.subtensor_url = self.config.subtensor
         self.netuid = getattr(self.config, "netuid", 64)
 
@@ -651,410 +590,6 @@ COMMIT;
             await self.reconcile_instance_audit_deletions(conn)
         await self.reconcile_instance_compute_history()
 
-    def get_random_image_payload(self, model: str):
-        """
-        Get a random request payload for diffusion chutes.
-        """
-        prompt = self.image_prompts[random.randint(0, len(self.image_prompts))][
-            self.config.synthetics.image.dataset.field_name
-        ]
-        prompt = prompt.lstrip('"').rstrip('"').replace('\\"', '"')
-        return {
-            "prompt": prompt,
-            "seed": random.randint(0, 1000000000),
-            "num_inference_steps": random.randint(5, 30),
-        }
-
-    def get_random_text_payload(self, model: str, endpoint: str = "chat"):
-        """
-        Get a random prompt for vllm chutes.
-        """
-        messages = self.text_prompts[random.randint(0, len(self.text_prompts))][
-            self.config.synthetics.text.dataset.field_name
-        ]
-        messages = [
-            {
-                "role": message["role"],
-                "content": message["content"],
-            }
-            for message in messages
-        ]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": random.random() + 0.1,
-            "seed": random.randint(0, 1000000000),
-            "max_tokens": random.randint(10, 200),
-            "stream": True,
-            "logprobs": True,
-        }
-        if endpoint != "chat":
-            payload["prompt"] = payload.pop("messages")[0]["content"]
-        return payload
-
-    async def load_chutes(self):
-        """
-        Load chutes from the API.
-        """
-        logger.debug("Loading chutes from API...")
-        async with self.aiosession() as session:
-            async with session.get(
-                "https://api.chutes.ai/chutes/?include_public=true&limit=1000&exclude=affine"
-            ) as resp:
-                data = await resp.json()
-                chutes = {}
-                for item in data["items"]:
-                    item["cords"] = data.get("cord_refs", {}).get(item["cord_ref_id"], [])
-                    chutes[item["chute_id"]] = munchify(item)
-                self.chutes = chutes
-
-    def _get_vllm_chute(self):
-        """
-        Randomly select a hot vllm chute.
-        """
-        vllm_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "vllm"
-            and any([instance.active and instance.verified for instance in chute.instances])
-        ]
-        if not vllm_chutes:
-            logger.warning("No vllm chutes hot - this is very bad and should not really happen...")
-            return None
-        return random.choice(vllm_chutes)
-
-    def _get_diffusion_chute(self):
-        """
-        Randomly select a hot diffusion chute.
-        """
-        diffusion_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "diffusion"
-            and any([instance.active and instance.verified for instance in chute.instances])
-        ]
-        if not diffusion_chutes:
-            logger.warning(
-                "No diffusion chutes hot - this is very bad and should not really happen..."
-            )
-            return None
-        return random.choice(diffusion_chutes)
-
-    def _get_tts_chute(self):
-        """
-        Randomly select a hot TTS chute.
-        """
-        tts_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if any([cord.path == "/speak" and not cord.stream for cord in chute.cords])
-            and chute.user.username == "chutes"
-        ]
-        if not tts_chutes:
-            logger.warning("No TTS chutes hot.")
-            return None
-        return random.choice(tts_chutes)
-
-    def _get_tei_chute(self, endpoint: str = "/embed"):
-        """
-        Get text-embeding-inference chutes.
-        """
-        tei_chutes = [
-            chute
-            for chute in self.chutes.values()
-            if chute.standard_template == "tei"
-            and any([cord.path == endpoint for cord in chute.cords])
-            and chute.user.username == "chutes"
-        ]
-        if not tei_chutes:
-            logger.warning("No TEI chutes hot.")
-            return None
-        return random.choice(tei_chutes)
-
-    def _render(self, chute, data):
-        if chute.standard_template == "diffusion" and self.config.synthetics.image.render:
-            try:
-                if (
-                    chute.standard_template == "diffusion"
-                    and isinstance(data["result"], dict)
-                    and data["result"].get("bytes")
-                ):
-                    with tempfile.NamedTemporaryFile(mode="wb") as outfile:
-                        outfile.write(base64.b64decode(data["result"]["bytes"].encode()))
-                        outfile.flush()
-                        image = image_from_file(outfile.name)
-                        image.draw()
-            except Exception as exc:
-                logger.warning(f"Could not render image: {exc}")
-        elif chute.standard_template == "vllm" and self.config.synthetics.text.render:
-            try:
-                chunk_data = json.loads(data["result"][6:])
-                if chunk_data["choices"][0].get("delta"):
-                    print(chunk_data["choices"][0]["delta"]["content"], end="", flush=True)
-                else:
-                    print(chunk_data["choices"][0]["text"], end="", flush=True)
-            except Exception:
-                ...
-        elif chute.standard_template == "tts" and self.config.synthetics.tts.render:
-            try:
-                if isinstance(data["result"], dict) and data["result"].get("bytes"):
-                    chunk_data = base64.b64decode(data["result"]["bytes"].encode())
-                    audio_io = io.BytesIO(chunk_data)
-                    audio_chunk, sr = sf.read(audio_io)
-                    if len(audio_chunk.shape) > 1:
-                        audio_chunk = np.mean(audio_chunk, axis=1)
-                    audio_chunk = audio_chunk.astype(np.float32)
-                    logger.info("Playing audio, turn up your volume...")
-                    sd.play(audio_chunk, 24000)
-                    sd.wait()
-            except Exception as exc:
-                logger.warning(f"Error playing audio: {exc}")
-        elif chute.standard_template == "tei" and self.config.synthetics.embed.render:
-            try:
-                if data["result"].get("json"):
-                    logger.info(
-                        f"Generated a matrix with shape: {np.array(data['result']['json']).shape}"
-                    )
-            except Exception as exc:
-                logger.warning(f"Failed to render embeddings: {exc}")
-
-    async def _perform_request(self, chute, payload, url) -> list[Synthetic]:
-        """
-        Perform invocation request.
-        """
-        try:
-            synthetics = []
-            async with self.aiosession() as session:
-                logger.info(f"Invoking {chute.name=} at {url}")
-                async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self.config.synthetics.api_key}",
-                        "X-Chutes-Trace": "true",
-                    },
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            f"Error sending synthetic to {chute.chute_id} [{chute.name}]: {resp.status=} {await resp.text()}"
-                        )
-                        return []
-                    parent_id = resp.headers["X-Chutes-InvocationID"]
-                    async for chunk_bytes in resp.content:
-                        if not chunk_bytes or not chunk_bytes.startswith(b"data: "):
-                            continue
-                        data = json.loads(chunk_bytes[6:])
-                        target = self._extract_target(data)
-                        if (target := self._extract_target(data)) is not None:
-                            self._debug_target(data)
-                            synthetics.append(
-                                Synthetic(
-                                    instance_id=target.instance_id,
-                                    parent_invocation_id=parent_id,
-                                    invocation_id=target.child_id,
-                                    chute_id=chute.chute_id,
-                                    miner_uid=target.uid,
-                                    miner_hotkey=target.hotkey,
-                                    created_at=func.timezone("UTC", func.now()),
-                                    has_error=False,
-                                )
-                            )
-                        elif (target := self._extract_target_error(data)) is not None:
-                            logger.warning(target.error)
-                            # Can't really not be the case that we're not talking about the existing attempt.
-                            assert target.instance_id == synthetics[-1].instance_id
-                            assert target.invocation_id == synthetics[-1].invocation_id
-                            synthetics[-1].has_error = True
-                        elif data.get("error"):
-                            logger.error(data["error"])
-                        elif data.get("result"):
-                            self._render(chute, data)
-            return synthetics
-        except Exception as exc:
-            logger.warning(f"Error performing synthetic request: {exc}")
-        return []
-
-    @staticmethod
-    def _debug_target(chunk) -> None:
-        """
-        Show debug logging for a chute invocation target.
-        """
-        message = "".join(
-            [
-                chunk["trace"]["timestamp"],
-                " ["
-                + " ".join(
-                    [
-                        f"{key}={value}"
-                        for key, value in chunk["trace"].items()
-                        if key not in ("timestamp", "message")
-                    ]
-                ),
-                f"]: {chunk['trace']['message']}",
-            ]
-        )
-        logger.info(message)
-
-    @staticmethod
-    def _extract_target(chunk) -> Target:
-        """
-        Extract miner info from trace messages.
-        """
-        if not chunk.get("trace"):
-            return None
-        message = chunk["trace"].get("message")
-        re_match = re.search(r"query target=([^ ]+) uid=([0-9+]+) hotkey=([^ ]+)", message)
-        if re_match:
-            return Target(
-                invocation_id=chunk["trace"].get("invocation_id"),
-                child_id=chunk["trace"].get("child_id"),
-                instance_id=re_match.group(1),
-                uid=re_match.group(2),
-                hotkey=re_match.group(3),
-            )
-        return None
-
-    @staticmethod
-    def _extract_target_error(chunk) -> Target:
-        """
-        Extract target errors from trace messages.
-        """
-        if not chunk.get("trace"):
-            return None
-        message = chunk["trace"].get("message")
-        re_match = re.search(
-            r"error encountered while querying target=([^ ]+) uid=([0-9]+) hotkey=([^ ]+) coldkey=[^ ]+: (.*)",
-            message,
-        )
-        if re_match:
-            return Target(
-                invocation_id=chunk["trace"].get("invocation_id"),
-                child_id=chunk["trace"].get("child_id"),
-                instance_id=re_match.group(1),
-                uid=re_match.group(2),
-                hotkey=re_match.group(3),
-                error=re_match.group(4),
-            )
-
-    async def _perform_chat(self) -> list[Synthetic]:
-        """
-        Perform a single chat request, with trace SSEs to see raw events.
-        """
-        if (chute := self._get_vllm_chute()) is None:
-            return None
-        payload = self.get_random_text_payload(model=chute.name, endpoint="chat")
-        synthetics = await self._perform_request(
-            chute, payload, "https://llm.chutes.ai/v1/chat/completions"
-        )
-        print("", flush=True)
-        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_completion(self) -> list[Synthetic]:
-        """
-        Perform a single LLM completion request, with trace SSEs to see raw events.
-        """
-        if (chute := self._get_vllm_chute()) is None:
-            return []
-        payload = self.get_random_text_payload(model=chute.name, endpoint="completion")
-        synthetics = await self._perform_request(
-            chute, payload, "https://llm.chutes.ai/v1/completions"
-        )
-        print("", flush=True)
-        logger.info(f"Chat invocation generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_image(self) -> list[Synthetic]:
-        """
-        Perform a single image generation request.
-        """
-        if (chute := self._get_diffusion_chute()) is None:
-            return []
-        payload = self.get_random_image_payload(model=chute.name)
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/generate"
-        )
-        logger.info(f"Image generation request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_tts(self) -> list[Synthetic]:
-        """
-        Perform a single text-to-speech request.
-        """
-        if (chute := self._get_tts_chute()) is None:
-            return []
-        while text := self.get_random_image_payload(model=chute.name)["prompt"][:1000]:
-            try:
-                language = detect_language(text)
-                if language == "en":
-                    break
-            except Exception:
-                ...
-        chute.standard_template = "tts"
-        payload = {"text": text}
-        if chute.name == "Kokoro-82M":
-            payload["voice"] = random.choice(
-                [
-                    "af",
-                    "af_bella",
-                    "af_sarah",
-                    "am_adam",
-                    "am_michael",
-                    "bf_emma",
-                    "bf_isabella",
-                    "bm_george",
-                    "bm_lewis",
-                    "af_nicole",
-                    "af_sky",
-                ]
-            )
-
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/speak"
-        )
-        logger.info(f"TTS generation request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def _perform_embedding(self) -> list[Synthetic]:
-        """
-        Perform a single text embedding request.
-        """
-        if (chute := self._get_tei_chute("/embed")) is None:
-            return []
-        text = self.get_random_image_payload(model=chute.name)["prompt"][:500]
-        payload = {"inputs": [text]}
-        synthetics = await self._perform_request(
-            chute, payload, f"https://{chute.slug}.chutes.ai/embed"
-        )
-        logger.info(f"Text embedding request generated {len(synthetics)} invocation objects.")
-        return synthetics
-
-    async def perform_synthetic(self):
-        """
-        Send a single, random synthetic request.
-        """
-        await self.load_chutes()
-
-        # Randomly select a task to perform.
-        task_type = random.choice(
-            [
-                "chat",
-                "completion",
-                "image",
-                "tts",
-                "embedding",
-            ]
-        )
-        logger.info(f"Attempting to perform synthetic task: {task_type=}")
-        synthetics = await getattr(self, f"_perform_{task_type}")()
-        if not synthetics:
-            return
-        async with get_session() as session:
-            for synthetic in synthetics:
-                session.add(synthetic)
-            await session.commit()
-        logger.success(f"Tracked {len(synthetics)} new synthetic records from {task_type} request")
-
     async def get_block_hash(self, substrate: AsyncSubstrateInterface, block: int) -> str:
         """
         Get a block (number) hash.
@@ -1182,8 +717,6 @@ COMMIT;
             raise ValueError(f"Path {db_record.path} attempts to escape base directory!")
         path.parent.mkdir(parents=True, exist_ok=True)
         audit_content = None
-        inv_csv_path = None
-        reports_csv_path = None
         jobs_csv_path = None
         data = None
         async with self.aiosession() as session:
@@ -1197,29 +730,6 @@ COMMIT;
 
                 if db_record.hotkey in self.validators:
                     vali_url = self.validators[db_record.hotkey]["url"]
-
-                    # Invocations CSV exports.
-                    inv = data.get("csv_exports", {}).get("invocations")
-                    if inv:
-                        remote_path = inv["path"].replace("invocations/", "/invocations/exports/")
-                        inv_csv_path = await self._download_csv(
-                            session, vali_url, remote_path, inv["path"], inv["sha256"], db_record
-                        )
-
-                    # Reports CSV exports.
-                    reports = data.get("csv_exports", {}).get("reports")
-                    if reports:
-                        remote_path = reports["path"].replace(
-                            "invocations/", "/invocations/exports/"
-                        )
-                        reports_csv_path = await self._download_csv(
-                            session,
-                            vali_url,
-                            remote_path,
-                            reports["path"],
-                            reports["sha256"],
-                            db_record,
-                        )
 
                     # Jobs CSV exports.
                     jobs = data.get("csv_exports", {}).get("jobs")
@@ -1247,112 +757,7 @@ COMMIT;
                     raise IntegrityViolation(
                         f"Commitment on chain does not match downloaded report! {db_record=}"
                     )
-        return data, inv_csv_path, reports_csv_path, jobs_csv_path
-
-    async def check_synthetics_in_csv(self, csv_path: str, db_record) -> None:
-        """
-        Check if our local synthetics appear in the validator's invocation CSV export.
-        This validates that synthetic requests were properly tracked without loading
-        all invocation data into the database.
-        """
-        # Build a set of invocation_ids from the CSV for fast lookup
-        csv_invocation_ids = set()
-        csv_invocations_by_id = {}
-        with open(csv_path, "r", newline="") as infile:
-            reader = csv.DictReader(infile)
-            for row in reader:
-                inv_id = row.get("invocation_id")
-                if inv_id:
-                    csv_invocation_ids.add(inv_id)
-                    csv_invocations_by_id[inv_id] = row
-
-        # Get synthetics that should have been tracked by this validator's report
-        async with get_session() as session:
-            result = await session.execute(
-                text(
-                    """
-                    SELECT parent_invocation_id, invocation_id, instance_id,
-                           chute_id, miner_uid, miner_hotkey, created_at
-                    FROM synthetics
-                    WHERE created_at < :end_time
-                    """
-                ),
-                {"end_time": db_record.end_time},
-            )
-            synthetics = result.mappings().all()
-
-        # Check each synthetic against the CSV
-        missing_count = 0
-        mismatched_count = 0
-        for synthetic in synthetics:
-            inv_id = synthetic["invocation_id"]
-            if inv_id not in csv_invocation_ids:
-                missing_count += 1
-                logger.warning(
-                    f"SYNTHETIC MISSING from CSV: invocation_id={inv_id} "
-                    f"instance_id={synthetic['instance_id']} "
-                    f"miner_hotkey={synthetic['miner_hotkey']}"
-                )
-            else:
-                # Check miner_hotkey matches
-                csv_row = csv_invocations_by_id.get(inv_id)
-                if csv_row and csv_row.get("miner_hotkey") != synthetic["miner_hotkey"]:
-                    mismatched_count += 1
-                    logger.warning(
-                        f"SYNTHETIC MINER MISMATCH: invocation_id={inv_id} "
-                        f"expected={synthetic['miner_hotkey']} "
-                        f"got={csv_row.get('miner_hotkey')}"
-                    )
-
-        if missing_count or mismatched_count:
-            logger.warning(
-                f"Synthetic validation: {missing_count} missing, {mismatched_count} mismatched "
-                f"out of {len(synthetics)} synthetics checked"
-            )
-        else:
-            logger.info(f"All {len(synthetics)} synthetics validated against CSV")
-
-    async def load_reports(self, session, csv_path):
-        """
-        Populate our local database with invocaton reports from CSV.
-        """
-        logger.info(f"Inserting invocation report records from {csv_path}")
-        total = 0
-        with open(csv_path, "r") as infile:
-            reader = csv.DictReader(infile)
-            batch = []
-            for row in reader:
-                row_data = dict(row)
-                row_data.update(
-                    {
-                        "timestamp": datetime.fromisoformat(row["timestamp"].rstrip("Z")).replace(
-                            tzinfo=None
-                        ),
-                    }
-                )
-                if row["confirmed_at"]:
-                    row_data.update(
-                        {
-                            "confirmed_at": datetime.fromisoformat(
-                                row["confirmed_at"].rstrip("Z")
-                            ).replace(tzinfo=None)
-                        }
-                    )
-                for key in row_data:
-                    if isinstance(row_data[key], str) and not row_data[key].strip():
-                        row_data[key] = None
-                batch.append(row_data)
-                total += 1
-                if len(batch) == 100:
-                    bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
-                    await session.execute(bulk_insert)
-                    batch = []
-            if batch:
-                bulk_insert = pg_insert(Report).values(batch).on_conflict_do_nothing()
-                await session.execute(bulk_insert)
-            await session.commit()
-        if total:
-            logger.success(f"Successfully loaded {total} reports from {csv_path}")
+        return data, jobs_csv_path
 
     async def load_jobs(self, session, csv_path):
         """
@@ -1835,7 +1240,7 @@ COMMIT;
         async with get_session() as session:
             query = select(AuditEntry).where(
                 or_(
-                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=7),
+                    AuditEntry.created_at < func.timezone("UTC", func.now()) - timedelta(days=1),
                     AuditEntry.processed.is_(False),
                 )
             )
@@ -1844,14 +1249,10 @@ COMMIT;
                 logger.info(f"Purging old audit entry: {entry.entry_id}")
                 await session.delete(entry)
                 delete_directories.append(f"/reports/{entry.entry_id}")
-            logger.info("Purging old synthetics...")
-            await session.execute(
-                text("DELETE FROM synthetics WHERE created_at <= NOW() - interval '169 hours'")
-            )
             logger.info("Purging old compute history data...")
             await session.execute(
                 text(
-                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at <= NOW() - interval '169 hours'"
+                    "DELETE FROM instance_compute_history WHERE ended_at IS NOT NULL AND ended_at < NOW() - interval '1 day'"
                 )
             )
             logger.info("Comitting...")
@@ -1900,12 +1301,7 @@ COMMIT;
             )
 
             # Download the report data locally and verify the integrity against commitment calls.
-            (
-                audit_data,
-                inv_csv_path,
-                reports_csv_path,
-                jobs_csv_path,
-            ) = await self.download_and_check_one(db_record)
+            (audit_data, jobs_csv_path) = await self.download_and_check_one(db_record)
 
             # Persist the record to DB.
             async with get_session() as session:
@@ -1914,24 +1310,13 @@ COMMIT;
                 logger.success(
                     f"Successfully verified and persisted record {db_record.entry_id} from {db_record.hotkey}"
                 )
-                # Check synthetics against invocation CSV if it's from a validator.
-                if inv_csv_path:
-                    await self.check_synthetics_in_csv(inv_csv_path, db_record)
-                    # Delete synthetics that have been validated
-                    await session.execute(
-                        text("DELETE FROM synthetics WHERE created_at < :end_time"),
-                        {"end_time": db_record.end_time},
-                    )
+                if db_record.hotkey in self.validators:
                     await session.execute(
                         text(
                             "UPDATE audit_entries SET processed = true WHERE entry_id = :entry_id"
                         ),
                         {"entry_id": db_record.entry_id},
                     )
-
-                # Load reports CSV.
-                if reports_csv_path:
-                    await self.load_reports(session, reports_csv_path)
 
                 # Load jobs CSV.
                 if jobs_csv_path:
@@ -1967,15 +1352,6 @@ COMMIT;
             await self.reconcile_instance_compute_history()
 
         return validator_total
-
-    async def send_and_verify_synthetics(self):
-        """
-        Continuously send synthetic requests. Verification is done via check_synthetics_in_csv
-        when processing validator audit CSV exports.
-        """
-        while self._running and self.config.synthetics.enabled:
-            await self.perform_synthetic()
-            await asyncio.sleep(60)
 
     async def compare_weights_to_actual(self, weights_tuple):
         """
@@ -2053,7 +1429,7 @@ COMMIT;
                 FROM miner_latest m
                 FULL OUTER JOIN validator_latest v
                     ON m.instance_id = v.instance_id AND m.miner_hotkey = v.miner_hotkey
-                WHERE COALESCE(m.created_at, v.created_at) >= NOW() - INTERVAL '7 days'
+                WHERE COALESCE(m.created_at, v.created_at) >= NOW() - INTERVAL '1 day'
                 ORDER BY COALESCE(m.miner_hotkey, v.miner_hotkey), COALESCE(m.created_at, v.created_at) DESC
             """)
 
@@ -2081,7 +1457,7 @@ COMMIT;
                 stats = miner_stats[hotkey]
                 stats["total"] += 1
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
                 if row["presence"] == "miner_missing":
                     stats["validator_only"] += 1
                     if row["v_activated"]:
@@ -2123,7 +1499,7 @@ COMMIT;
                         stats["multiplier_mismatches"] += 1
 
             # Log summary per miner
-            logger.info("Instance audit comparison (miner vs validator) - last 7 days:")
+            logger.info("Instance audit comparison (miner vs validator) - last 24 hours:")
             logger.info(
                 f"{'Hotkey':<20} {'Total':>6} {'Both':>6} {'M-Only':>7} {'V-Only':>7} "
                 f"{'TsMis':>6} {'MulMis':>7} {'M-Secs':>12} {'V-Secs':>12} {'Ratio':>6}"
@@ -2164,6 +1540,8 @@ COMMIT;
     async def _verify_integrity(self):
         """
         Continuously check for new audit data, verify the numbers line up, and set weights.
+        Polls every 60s waiting for new validator data. Once new data is processed and weights
+        are set, sleeps until the top of the next hour to match the validator's export cadence.
         """
         first_run = True
         while self._running:
@@ -2176,7 +1554,6 @@ COMMIT;
                 continue
 
             if not await self.download_and_check_audit_reports():
-                # No new data, let's see how long we should wait before trying again.
                 async with get_session() as session:
                     most_recent = (
                         await session.execute(
@@ -2186,19 +1563,21 @@ COMMIT;
                 if not most_recent:
                     # This is basically impossible?
                     logger.warning("Should not be here, why???")
-
-                if first_run and most_recent:
+                elif first_run:
+                    # One-time diagnostic on startup when there's no new data yet.
                     logger.info(
                         "No new audit data, but here is the most recent weight data output from the "
                         f"report spanning {most_recent.start_time} through {most_recent.end_time}"
                     )
-                    await self.compare_weights_to_actual(await self.get_weights_to_set())
+                    try:
+                        await self.compare_weights_to_actual(await self.get_weights_to_set())
+                    except Exception as exc:
+                        logger.error(f"Initial weight comparison failed: {exc}")
                     try:
                         await self.compare_miner_metrics()
                     except Exception as exc:
                         logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
-                        # XXX not blocking though, because it's a comparison and miners often
-                        # don't report anyways.
+                await asyncio.sleep(60)
             else:
                 if self.config.set_weights.enabled:
                     await self.get_and_set_weights()
@@ -2211,7 +1590,15 @@ COMMIT;
                     await self.compare_miner_metrics()
                 except Exception as exc:
                     logger.warning(f"Failed to compare against miner metrics: {str(exc)}")
-            await asyncio.sleep(60)
+
+                # Sleep until the top of the next hour to match the validator's export cadence.
+                now = datetime.now(timezone.utc)
+                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                sleep_seconds = (next_hour - now).total_seconds()
+                action = "Weights set" if self.config.set_weights.enabled else "Audit complete"
+                logger.info(f"{action}; sleeping {sleep_seconds:.0f}s until {next_hour.strftime('%H:%M')} UTC")
+                await asyncio.sleep(sleep_seconds)
+
             first_run = False
 
     async def verify_integrity_and_set_weights(self):
@@ -2302,14 +1689,10 @@ COMMIT;
         Main loop, to do all the things.
         """
         async with engine.begin() as conn:
-            # Drop the invocations table and all partitions - no longer needed for scoring
+            # Drop tables no longer used for scoring
             await conn.execute(text("DROP TABLE IF EXISTS invocations CASCADE"))
+            await conn.execute(text("DROP TABLE IF EXISTS reports CASCADE"))
             await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_reports_parent_confirmed ON reports (invocation_id) INCLUDE (confirmed_at);"
-                )
-            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_metagraph_nodes_netuid_hotkey ON metagraph_nodes(netuid, hotkey);"
@@ -2353,7 +1736,6 @@ COMMIT;
         tasks = []
         try:
             tasks.append(asyncio.create_task(self.verify_integrity_and_set_weights()))
-            tasks.append(asyncio.create_task(self.send_and_verify_synthetics()))
             while True:
                 await asyncio.sleep(60)
         except KeyboardInterrupt:
