@@ -969,20 +969,18 @@ COMMIT;
 
         instances_query = text(INSTANCES_QUERY.format(interval=SCORING_INTERVAL))
 
-        # Load active miners from metagraph (and map coldkey pairings to de-dupe multi-hotkey miners).
+        # Load active miners from metagraph.
         raw_values = {}
         logger.info("Loading metagraph for netuid=64...")
         async with get_session() as session:
             metagraph_nodes = await session.execute(
                 text(
-                    "SELECT coldkey, hotkey FROM metagraph_nodes WHERE netuid = 64 AND node_id >= 0"
+                    "SELECT hotkey FROM metagraph_nodes WHERE netuid = 64 AND node_id >= 0"
                 )
             )
-            hot_cold_map = {hotkey: coldkey for coldkey, hotkey in metagraph_nodes}
-            coldkey_counts = {
-                coldkey: sum([1 for _, ck in hot_cold_map.items() if ck == coldkey])
-                for coldkey in hot_cold_map.values()
-            }
+            active_hotkeys = set()
+            for (hotkey,) in metagraph_nodes:
+                active_hotkeys.add(hotkey)
 
         # Base score - instances active during the scoring period.
         logger.info("Fetching scores based on active instances during scoring interval...")
@@ -995,7 +993,7 @@ COMMIT;
                 instance_seconds,
                 instance_compute_units,
             ) in instances_result:
-                if not hotkey or hotkey not in hot_cold_map or hotkey in blacklisted_hotkeys:
+                if not hotkey or hotkey not in active_hotkeys or hotkey in blacklisted_hotkeys:
                     continue
                 raw_values[hotkey] = {
                     "total_instances": float(total_instances or 0.0),
@@ -1006,22 +1004,6 @@ COMMIT;
 
         # Build scores from instance compute units.
         scores = {hk: data["instance_compute_units"] for hk, data in raw_values.items()}
-
-        # Purge multi-hotkey miners - keep only the highest scoring hotkey per coldkey
-        hotkeys_to_remove = set()
-        for coldkey in set(hot_cold_map.values()):
-            if coldkey_counts.get(coldkey, 0) > 1:
-                coldkey_hotkeys = [
-                    hk for hk, ck in hot_cold_map.items() if ck == coldkey and hk in scores
-                ]
-                if len(coldkey_hotkeys) > 1:
-                    coldkey_hotkeys.sort(key=lambda hk: scores.get(hk, 0.0), reverse=True)
-                    hotkeys_to_remove.update(coldkey_hotkeys[1:])
-
-        for hotkey in hotkeys_to_remove:
-            scores.pop(hotkey, None)
-            raw_values.pop(hotkey, None)
-            logger.warning(f"Purging hotkey from multi-uid miner: {hotkey=}")
 
         # Normalize to distribution.
         score_sum = sum(max(0.0, v) for v in scores.values())
