@@ -757,7 +757,7 @@ COMMIT;
         #         ):
         #             raise IntegrityViolation(
         #                 f"Commitment on chain does not match downloaded report! {db_record=}"
-                    )
+        #             )
         return data, jobs_csv_path
 
     async def load_jobs(self, session, csv_path):
