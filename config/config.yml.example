@@ -1,7 +1,7 @@
 # Which validators to audit.
 validators:
 - name: Chutes
-  hotkey: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
+  hotkey: 5DU1dvXbvjVRs5omKrbZzLNB6ZL9uNnzQrS1H8MFcSdFS7ww
   url: https://api.chutes.ai
 
 # Subtensor node to query.

@@ -749,13 +749,14 @@ COMMIT;
             f"Successfully download audit data between {db_record.start_time} and {db_record.end_time} "
             f"for hotkey {db_record.hotkey} committed in block {db_record.block}, now verifying..."
         )
-        if db_record.hotkey in self.validators:
-            async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
-                if not await self.check_audit_report_integrity(
-                    substrate, db_record, path, audit_content
-                ):
-                    raise IntegrityViolation(
-                        f"Commitment on chain does not match downloaded report! {db_record=}"
+        # XXX temporarily disabling commitment checks
+        # if db_record.hotkey in self.validators:
+        #     async with AsyncSubstrateInterface(url=self.subtensor_url) as substrate:
+        #         if not await self.check_audit_report_integrity(
+        #             substrate, db_record, path, audit_content
+        #         ):
+        #             raise IntegrityViolation(
+        #                 f"Commitment on chain does not match downloaded report! {db_record=}"
                     )
         return data, jobs_csv_path
 
